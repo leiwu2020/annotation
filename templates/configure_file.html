@@ -1,0 +1,129 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Configure File: {{ annotation_file.original_filename }}</h1>
+  <p>Select which columns users can edit and configure their input type.</p>
+</div>
+
+<div class="configure-form">
+  <form method="POST">
+    <div class="form-group">
+      <label>Column Configuration:</label>
+      <div class="column-config-list">
+        {% for column in columns %}
+        <div class="column-config-item">
+          <div class="column-header">
+            <div class="checkbox-item">
+              <input type="checkbox" 
+                     id="column_{{ loop.index }}" 
+                     name="editable_columns" 
+                     value="{{ column }}" 
+                     {% if column in editable_columns %}checked{% endif %}
+                     onchange="toggleColumnConfig('{{ column }}', this.checked)">
+              <label for="column_{{ loop.index }}"><strong>{{ column }}</strong></label>
+            </div>
+          </div>
+          
+          <div class="column-config-options" id="config_{{ column }}" style="{% if column not in editable_columns %}display: none;{% endif %}">
+            <div class="config-type">
+              <label>Input Type:</label>
+              <div class="radio-group">
+                <label class="radio-item">
+                  <input type="radio" 
+                         name="config_type_{{ column }}" 
+                         value="free_edit" 
+                         {% if column_configs.get(column, {}).get('type', 'free_edit') == 'free_edit' %}checked{% endif %}>
+                  Free Text Edit
+                </label>
+                <label class="radio-item">
+                  <input type="radio" 
+                         name="config_type_{{ column }}" 
+                         value="dropdown" 
+                         {% if column_configs.get(column, {}).get('type') == 'dropdown' %}checked{% endif %}>
+                  Dropdown List
+                </label>
+                <label class="radio-item">
+                  <input type="radio" 
+                         name="config_type_{{ column }}" 
+                         value="multi_choice" 
+                         {% if column_configs.get(column, {}).get('type') == 'multi_choice' %}checked{% endif %}>
+                  Multi-Choice
+                </label>
+              </div>
+            </div>
+            
+            <div class="dropdown-config" id="dropdown_{{ column }}" style="{% if column_configs.get(column, {}).get('type') != 'dropdown' %}display: none;{% endif %}">
+              <label for="dropdown_values_{{ column }}">Dropdown Values (one per line):</label>
+              <textarea name="dropdown_values_{{ column }}" 
+                        id="dropdown_values_{{ column }}" 
+                        rows="5" 
+                        placeholder="Enter valid values, one per line...">{{ column_configs.get(column, {}).get('dropdown_values', []) | join('\n') }}</textarea>
+              <small class="form-text">Each line will be a separate option in the dropdown.</small>
+            </div>
+            
+            <div class="multi-choice-config" id="multi_choice_{{ column }}" style="{% if column_configs.get(column, {}).get('type') != 'multi_choice' %}display: none;{% endif %}">
+              <label for="multi_choice_values_{{ column }}">Multi-Choice Options (one per line):</label>
+              <textarea name="multi_choice_values_{{ column }}" 
+                        id="multi_choice_values_{{ column }}" 
+                        rows="5" 
+                        placeholder="Enter valid values, one per line...">{{ column_configs.get(column, {}).get('multi_choice_values', []) | join('\n') }}</textarea>
+              <small class="form-text">Each line will be a separate checkbox option. Users can select multiple values.</small>
+            </div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      <small class="form-text">Check the columns that users should be able to edit and configure their input type.</small>
+    </div>
+    
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Save Configuration</button>
+      <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<div class="file-info">
+  <h3>File Information:</h3>
+  <ul>
+    <li><strong>Original Filename:</strong> {{ annotation_file.original_filename }}</li>
+    <li><strong>Uploaded:</strong> {{ annotation_file.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</li>
+    <li><strong>Total Columns:</strong> {{ columns|length }}</li>
+  </ul>
+</div>
+
+<script>
+function toggleColumnConfig(columnName, isChecked) {
+  const configDiv = document.getElementById('config_' + columnName);
+  if (isChecked) {
+    configDiv.style.display = 'block';
+  } else {
+    configDiv.style.display = 'none';
+  }
+}
+
+// Handle radio button changes to show/hide dropdown and multi-choice config
+document.addEventListener('DOMContentLoaded', function() {
+  const radioButtons = document.querySelectorAll('input[type="radio"][name^="config_type_"]');
+  radioButtons.forEach(function(radio) {
+    radio.addEventListener('change', function() {
+      const columnName = this.name.replace('config_type_', '');
+      const dropdownDiv = document.getElementById('dropdown_' + columnName);
+      const multiChoiceDiv = document.getElementById('multi_choice_' + columnName);
+      
+      if (this.value === 'dropdown') {
+        dropdownDiv.style.display = 'block';
+        multiChoiceDiv.style.display = 'none';
+      } else if (this.value === 'multi_choice') {
+        dropdownDiv.style.display = 'none';
+        multiChoiceDiv.style.display = 'block';
+      } else {
+        dropdownDiv.style.display = 'none';
+        multiChoiceDiv.style.display = 'none';
+      }
+    });
+  });
+});
+</script>
+{% endblock %}

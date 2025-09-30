@@ -1,0 +1,33 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Upload CSV File</h1>
+  <p>Upload a CSV file for annotation by users.</p>
+</div>
+
+<div class="upload-form">
+  <form method="POST" enctype="multipart/form-data">
+    <div class="form-group">
+      <label for="file">Select CSV File:</label>
+      <input type="file" id="file" name="file" accept=".csv" required>
+      <small class="form-text">Only CSV files are allowed.</small>
+    </div>
+    
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Upload File</button>
+      <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<div class="upload-info">
+  <h3>Instructions:</h3>
+  <ul>
+    <li>Upload a CSV file that contains the data to be annotated</li>
+    <li>After upload, you'll be able to configure which columns are editable</li>
+    <li>You can then assign the file to specific users for annotation</li>
+    <li>Users will receive their own copy of the file to work on</li>
+  </ul>
+</div>
+{% endblock %}

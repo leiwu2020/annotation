@@ -1,0 +1,23 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h2>Assign File: {{ annotation_file.original_filename }}</h2>
+<div class="card">
+  <form method="post">
+    <div class="form-group">
+      <label>Select Users to Assign:</label>
+      <div class="checkbox-group">
+        {% for user in users %}
+        <label class="checkbox-label">
+          <input type="checkbox" name="user_ids" value="{{ user.id }}">
+          {{ user.username }} ({{ user.first_name }} {{ user.last_name }})
+        </label>
+        {% endfor %}
+      </div>
+      <small class="form-text">Each user will get their own copy of the file to annotate.</small>
+    </div>
+    <button type="submit" class="btn">Assign to Selected Users</button>
+    <a href="{{ url_for('dashboard') }}" class="btn outline">Cancel</a>
+  </form>
+</div>
+{% endblock %}
+

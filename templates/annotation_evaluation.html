@@ -1,0 +1,166 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Annotation Evaluation</h1>
+  <p>Compare multiple annotation assignments to calculate overlap rates and inter-annotator agreement.</p>
+</div>
+
+<div class="evaluation-interface">
+  <form method="POST">
+    <div class="form-group">
+      <label>Select Completed Assignments to Compare:</label>
+      <div class="assignment-selection">
+        {% if all_assignments %}
+          <div class="assignment-list">
+            {% for assignment in all_assignments %}
+            <div class="assignment-item">
+              <label class="assignment-checkbox">
+                <input type="checkbox" 
+                       name="assignment_ids" 
+                       value="{{ assignment.id }}"
+                       id="assignment_{{ assignment.id }}">
+                <div class="assignment-info">
+                  <div class="assignment-header">
+                    <strong>{{ assignment.annotation_file.original_filename }}</strong>
+                  </div>
+                  <div class="assignment-details">
+                    <span class="user-info">User: {{ assignment.user.first_name }} {{ assignment.user.last_name }} ({{ assignment.user.username }})</span>
+                    <span class="completion-info">Completed: {{ assignment.completed_at.strftime('%Y-%m-%d %H:%M') }}</span>
+                    <span class="file-info">File ID: {{ assignment.id }}</span>
+                  </div>
+                </div>
+              </label>
+            </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="no-assignments">
+            <p>No completed assignments available for evaluation.</p>
+            <p>Complete some annotation tasks first to enable evaluation.</p>
+          </div>
+        {% endif %}
+      </div>
+      <small class="form-text">Select at least 2 completed assignments to compare their annotations.</small>
+    </div>
+    
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary" {% if not all_assignments %}disabled{% endif %}>
+        Calculate Overlap Rates
+      </button>
+      <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Back to Dashboard</a>
+    </div>
+  </form>
+</div>
+
+{% if evaluation_results %}
+<div class="evaluation-results">
+  <h2>Evaluation Results</h2>
+  
+  <div class="results-summary">
+    <div class="summary-stats">
+      <div class="stat-item">
+        <span class="stat-label">Assignments Compared:</span>
+        <span class="stat-value">{{ assignments|length }}</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-label">Pairwise Comparisons:</span>
+        <span class="stat-value">{{ evaluation_results|length }}</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-label">Average Overlap:</span>
+        <span class="stat-value">
+          {{ "%.1f"|format(evaluation_results | map(attribute='overlap_percentage') | list | sum / evaluation_results|length if evaluation_results else 0) }}%
+        </span>
+      </div>
+    </div>
+  </div>
+  
+  <div class="comparison-results">
+    {% for result in evaluation_results %}
+    <div class="comparison-item">
+      <div class="comparison-header">
+        <h3>Comparison: {{ result.assignment1.user.username }} vs {{ result.assignment2.user.username }}</h3>
+        <div class="comparison-files">
+          <span class="file-info">File: {{ result.assignment1.annotation_file.original_filename }}</span>
+        </div>
+      </div>
+      
+      <div class="comparison-stats">
+        <div class="stat-grid">
+          <div class="stat-card">
+            <div class="stat-number">{{ result.overlap_percentage }}%</div>
+            <div class="stat-label">Overlap Rate</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-number">{{ result.exact_matches }}</div>
+            <div class="stat-label">Exact Matches</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-number">{{ result.total_comparisons }}</div>
+            <div class="stat-label">Total Comparisons</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-number">{{ result.rows_compared }}</div>
+            <div class="stat-label">Rows Compared</div>
+          </div>
+        </div>
+        
+        <div class="agreement-indicator">
+          {% if result.overlap_percentage >= 90 %}
+            <span class="agreement-level excellent">Excellent Agreement</span>
+          {% elif result.overlap_percentage >= 80 %}
+            <span class="agreement-level good">Good Agreement</span>
+          {% elif result.overlap_percentage >= 70 %}
+            <span class="agreement-level moderate">Moderate Agreement</span>
+          {% elif result.overlap_percentage >= 60 %}
+            <span class="agreement-level fair">Fair Agreement</span>
+          {% else %}
+            <span class="agreement-level poor">Poor Agreement</span>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  // Handle form submission validation
+  const form = document.querySelector('form');
+  const submitButton = document.querySelector('button[type="submit"]');
+  
+  if (form && submitButton) {
+    form.addEventListener('submit', function(e) {
+      const checkedBoxes = document.querySelectorAll('input[name="assignment_ids"]:checked');
+      
+      if (checkedBoxes.length < 2) {
+        e.preventDefault();
+        alert('Please select at least 2 assignments to compare.');
+        return false;
+      }
+      
+      // Show loading state
+      submitButton.textContent = 'Calculating...';
+      submitButton.disabled = true;
+    });
+  }
+  
+  // Handle checkbox selection
+  const checkboxes = document.querySelectorAll('input[name="assignment_ids"]');
+  checkboxes.forEach(function(checkbox) {
+    checkbox.addEventListener('change', function() {
+      const checkedCount = document.querySelectorAll('input[name="assignment_ids"]:checked').length;
+      
+      if (checkedCount >= 2) {
+        submitButton.disabled = false;
+      } else {
+        submitButton.disabled = true;
+      }
+    });
+  });
+});
+</script>
+{% endblock %}

@@ -1,0 +1,57 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Welcome, {{ user.first_name }}!</h1>
+  <p>Here are your assigned annotation tasks.</p>
+</div>
+
+<div class="assignments-container">
+  {% if assignments %}
+    <div class="assignments-grid">
+      {% for assignment in assignments %}
+      <div class="assignment-card">
+        <div class="assignment-header">
+          <h3>{{ assignment.annotation_file.original_filename }}</h3>
+          <span class="status-badge status-{{ assignment.status }}">{{ assignment.status|title }}</span>
+        </div>
+        
+        <div class="assignment-details">
+          <p><strong>Assigned:</strong> {{ assignment.assigned_at.strftime('%Y-%m-%d %H:%M:%S') }}</p>
+          {% if assignment.completed_at %}
+            <p><strong>Completed:</strong> {{ assignment.completed_at.strftime('%Y-%m-%d %H:%M:%S') }}</p>
+          {% endif %}
+        </div>
+        
+        <div class="assignment-actions">
+          {% if assignment.status == 'assigned' or assignment.status == 'in_progress' %}
+            <a href="{{ url_for('annotate_file', assignment_id=assignment.id) }}" class="btn btn-primary">
+              {% if assignment.status == 'assigned' %}Start Annotation{% else %}Continue Annotation{% endif %}
+            </a>
+          {% elif assignment.status == 'completed' %}
+            <span class="btn btn-success disabled">Completed</span>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="no-assignments">
+      <div class="empty-state">
+        <h3>No Assignments</h3>
+        <p>You don't have any annotation assignments yet. Contact your administrator to get started.</p>
+      </div>
+    </div>
+  {% endif %}
+</div>
+
+<div class="user-info">
+  <h3>Your Information:</h3>
+  <ul>
+    <li><strong>Name:</strong> {{ user.first_name }} {{ user.last_name }}</li>
+    <li><strong>Organization:</strong> {{ user.organization }}</li>
+    <li><strong>Position:</strong> {{ user.position }}</li>
+    <li><strong>Email:</strong> {{ user.email }}</li>
+  </ul>
+</div>
+{% endblock %}

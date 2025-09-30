@@ -1,0 +1,194 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h2>Admin Dashboard</h2>
+<p>Welcome, {{ user.first_name }} {{ user.last_name }} (Admin)</p>
+
+<div class="admin-stats">
+  <div class="stat-card">
+    <h3>{{ pending_users|length }}</h3>
+    <p>Pending Approvals</p>
+  </div>
+  <div class="stat-card">
+    <h3>{{ annotation_files|length }}</h3>
+    <p>Annotation Files</p>
+  </div>
+  <div class="stat-card">
+    <h3>{{ assignments|length }}</h3>
+    <p>Total Assignments</p>
+  </div>
+</div>
+
+<div class="admin-actions">
+  <a href="{{ url_for('upload_file') }}" class="btn">Upload CSV File</a>
+  <a href="{{ url_for('evaluate_annotations') }}" class="btn">Evaluate Annotations</a>
+</div>
+
+{% if pending_users %}
+<div class="pending-users">
+  <h3>Pending User Registrations</h3>
+  <div class="user-cards">
+    {% for user in pending_users %}
+    <div class="user-card">
+      <div class="user-info">
+        <h4>{{ user.first_name }} {{ user.last_name }}</h4>
+        <p><strong>Username:</strong> {{ user.username }}</p>
+        <p><strong>Email:</strong> {{ user.email }}</p>
+        <p><strong>Organization:</strong> {{ user.organization }}</p>
+        <p><strong>Position:</strong> {{ user.position }}</p>
+        <p><strong>Phone:</strong> {{ user.phone }}</p>
+        <p><strong>Registered:</strong> {{ user.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+      </div>
+      <div class="user-actions">
+        <a href="{{ url_for('approve_user', user_id=user.id) }}" class="btn approve-btn">Approve</a>
+        <a href="{{ url_for('reject_user', user_id=user.id) }}" class="btn reject-btn" onclick="return confirm('Are you sure you want to reject this user? This action cannot be undone.')">Reject</a>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% else %}
+<div class="no-pending">
+  <h3>No Pending Registrations</h3>
+  <p>All user registrations have been processed.</p>
+</div>
+{% endif %}
+
+{% if annotation_files %}
+<div class="annotation-files">
+  <h3>Annotation Files</h3>
+  <div class="file-cards">
+    {% for file in annotation_files %}
+    <div class="file-card">
+      <div class="file-info">
+        <h4>{{ file.original_filename }}</h4>
+        <p><strong>Uploaded:</strong> {{ file.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+        <p><strong>Editable Columns:</strong> {{ file.editable_columns|length }} columns</p>
+      </div>
+      <div class="file-actions">
+        <a href="{{ url_for('configure_file', file_id=file.id) }}" class="btn outline">Configure</a>
+        <a href="{{ url_for('assign_file', file_id=file.id) }}" class="btn">Assign Users</a>
+        <a href="{{ url_for('delete_annotation_file', file_id=file.id) }}" 
+           class="btn btn-danger" 
+           onclick="return confirm('Are you sure you want to delete this file and all related assignments? This action cannot be undone.')">Delete</a>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{% if assignments %}
+<div class="assignments">
+  <h3>Annotation Assignments</h3>
+  <div class="assignment-table">
+    <table>
+      <thead>
+        <tr>
+          <th>File</th>
+          <th>User</th>
+          <th>Status</th>
+          <th>Assigned</th>
+          <th>Completed</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for assignment in assignments %}
+        <tr>
+          <td>{{ assignment.annotation_file.original_filename }}</td>
+          <td>{{ assignment.user.username }}</td>
+          <td>
+            <span class="status-badge {{ assignment.status }}">
+              {{ assignment.status.replace('_', ' ').title() }}
+            </span>
+          </td>
+          <td>{{ assignment.assigned_at.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td>
+            {% if assignment.completed_at %}
+              {{ assignment.completed_at.strftime('%Y-%m-%d %H:%M') }}
+            {% else %}
+              -
+            {% endif %}
+          </td>
+          <td class="assignment-actions">
+            {% if assignment.status == 'completed' %}
+              <div class="completed-actions">
+                <a href="{{ url_for('download_annotation', assignment_id=assignment.id) }}" class="btn btn-success btn-sm">Download</a>
+                <button onclick="restartAssignment({{ assignment.id }})" class="btn btn-warning btn-sm">Restart</button>
+                <button onclick="deleteAssignment({{ assignment.id }}, '{{ assignment.user.username }}')" class="btn btn-danger btn-sm">Delete</button>
+              </div>
+            {% elif assignment.status == 'in_progress' %}
+              <div class="in-progress-actions">
+                <span class="status-text">In Progress</span>
+                <button onclick="deleteAssignment({{ assignment.id }}, '{{ assignment.user.username }}')" class="btn btn-danger btn-sm">Delete</button>
+              </div>
+            {% else %}
+              <div class="assigned-actions">
+                <span class="status-text">Assigned</span>
+                <button onclick="deleteAssignment({{ assignment.id }}, '{{ assignment.user.username }}')" class="btn btn-danger btn-sm">Delete</button>
+              </div>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<div class="admin-actions">
+  <a class="btn" href="{{ url_for('logout') }}">Logout</a>
+</div>
+
+<script>
+function restartAssignment(assignmentId) {
+  if (confirm('Are you sure you want to restart this assignment? The user will be able to annotate again.')) {
+    fetch(`/admin/restart_assignment/${assignmentId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      }
+    })
+    .then(response => response.json())
+    .then(data => {
+      if (data.success) {
+        alert(data.message);
+        location.reload();
+      } else {
+        alert('Error: ' + data.error);
+      }
+    })
+    .catch(error => {
+      console.error('Error:', error);
+      alert('Error restarting assignment');
+    });
+  }
+}
+
+function deleteAssignment(assignmentId, username) {
+  if (confirm(`Are you sure you want to delete the assignment for ${username}? This will permanently delete the assignment and the user's CSV file. This action cannot be undone.`)) {
+    fetch(`/admin/delete_assignment/${assignmentId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      }
+    })
+    .then(response => response.json())
+    .then(data => {
+      if (data.success) {
+        alert(data.message);
+        location.reload();
+      } else {
+        alert('Error: ' + data.error);
+      }
+    })
+    .catch(error => {
+      console.error('Error:', error);
+      alert('Error deleting assignment');
+    });
+  }
+}
+</script>
+
+{% endblock %}

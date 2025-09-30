@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Annotate File</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>Annotate File: {{ assignment.annotation_file.original_filename }}</h1>
+        
+        <div class="annotation-controls">
+            <div class="auto-save-indicator" id="auto-save-indicator">Auto-save enabled ✓</div>
+            <a href="{{ url_for('dashboard') }}" class="btn" onclick="return saveAndNavigate(event)">Dashboard</a>
+            <a href="{{ url_for('logout') }}" onclick="return saveAndNavigate(event)" class="btn">Logout</a>
+            <button onclick="completeAnnotation()" class="btn btn-success">Done</button>
+        </div>
+        
+        <table class="annotation-table">
+            <thead>
+                <tr>
+                    {% for column in columns %}
+                    <th class="{% if column in editable_columns %}editable-header{% else %}readonly-header{% endif %}">
+                        {{ column }}
+                    </th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in data %}{% set outer_loop = loop %}
+                <tr>
+                    {% for column in columns %}
+                    <td class="{% if column in editable_columns %}editable-cell{% else %}readonly-cell{% endif %}">
+                        {% if column in editable_columns %}
+                            {% set config = column_configs.get(column, {}) %}
+                            {% if config.get('type') == 'dropdown' %}
+                                <select data-column="{{ column }}" 
+                                        data-row="{{ outer_loop.index0 }}"
+                                        class="annotation-input annotation-select"
+                                        onchange="saveCell(this)">
+                                    <option value="">-- Select --</option>
+                                    {% for value in config.get('dropdown_values', []) %}
+                                        <option value="{{ value }}" {% if row[column] == value %}selected{% endif %}>{{ value }}</option>
+                                    {% endfor %}
+                                </select>
+                            {% elif config.get('type') == 'multi_choice' %}
+                                <div class="multi-choice-container" data-column="{{ column }}" data-row="{{ outer_loop.index0 }}">
+                                    {% set selected_values = row[column].split(',') if row[column] else [] %}
+                                    {% for value in config.get('multi_choice_values', []) %}
+                                        <label class="multi-choice-item">
+                                            <input type="checkbox" 
+                                                   value="{{ value }}"
+                                                   {% if value in selected_values %}checked{% endif %}
+                                                   onchange="saveMultiChoiceCell(this)">
+                                            <span>{{ value }}</span>
+                                        </label>
+                                    {% endfor %}
+                                </div>
+                            {% else %}
+                                <input type="text" 
+                                       value="{{ row[column] }}" 
+                                       defaultValue="{{ row[column] }}"
+                                       data-column="{{ column }}" 
+                                       data-row="{{ outer_loop.index0 }}"
+                                       class="annotation-input"
+                                       onkeyup="saveCellDelayed(this)"
+                                       onchange="saveCell(this)"
+                                       onblur="saveCellImmediate(this)">
+                            {% endif %}
+                        {% else %}
+                            {{ row[column] }}
+                        {% endif %}
+                    </td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="annotation-actions">
+        <button onclick="completeAnnotation()" class="btn complete-btn">Mark as Done</button>
+        <a href="{{ url_for('dashboard') }}" class="btn outline" onclick="return saveAndNavigate(event)">Back to Dashboard</a>
+    </div>
+
+<script>
+let saveTimeout;
+let inputTimeout;
+const assignmentId = {{ assignment.id }};
+let pendingChanges = new Map(); // Store pending changes
+
+function saveCell(input) {
+  // Call the specific input save function
+  saveSpecificInput(input);
+}
+
+function saveCellImmediate(input) {
+  // Call the specific input save function
+  saveSpecificInput(input);
+}
+
+function showSaveIndicator() {
+  const indicator = document.querySelector('.auto-save-indicator');
+  indicator.textContent = 'Auto-saved ✓';
+  indicator.style.color = '#10b981';
+  setTimeout(() => {
+    indicator.textContent = 'Auto-save enabled ✓';
+    indicator.style.color = '#6b7280';
+  }, 2000);
+}
+
+function saveAllPendingChanges() {
+  // Individual row saves are handled automatically by saveSpecificInput
+  const indicator = document.querySelector('.auto-save-indicator');
+  indicator.textContent = 'Auto-save working ✓';
+  indicator.style.color = '#10b981';
+  setTimeout(() => {
+    indicator.textContent = 'Auto-save enabled ✓';
+    indicator.style.color = '#6b7280';
+  }, 2000);
+}
+
+function saveAllPendingChangesSync() {
+  // Individual row saves are handled automatically by saveSpecificInput
+  const indicator = document.querySelector('.auto-save-indicator');
+  indicator.textContent = 'Auto-save working ✓';
+  indicator.style.color = '#10b981';
+  setTimeout(() => {
+    indicator.textContent = 'Auto-save enabled ✓';
+    indicator.style.color = '#6b7280';
+  }, 2000);
+}
+
+function completeAnnotation() {
+  // Individual row saves are handled automatically by saveSpecificInput
+  // Mark the annotation as completed
+  fetch('/complete_annotation/{{ assignment.id }}', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    }
+  })
+  .then(response => response.json())
+  .then(data => {
+    if (data.success) {
+      const indicator = document.querySelector('.auto-save-indicator');
+      indicator.textContent = 'Task completed ✓';
+      indicator.style.color = '#10b981';
+      
+      // Navigate to dashboard after showing success message
+      setTimeout(() => {
+        window.location.href = "{{ url_for('dashboard') }}";
+      }, 2000);
+    } else {
+      console.error('Failed to complete annotation:', data.error);
+      alert('Failed to complete annotation. Please try again.');
+    }
+  })
+  .catch(error => {
+    console.error('Error completing annotation:', error);
+    alert('Error completing annotation. Please try again.');
+  });
+}
+
+function saveAndNavigate(event) {
+  // Individual row saves are handled automatically by saveSpecificInput
+  // Allow navigation to proceed
+  return true;
+}
+
+
+function saveCellDelayed(input) {
+  // Clear any existing timeout
+  clearTimeout(inputTimeout);
+  
+  // Wait a bit for the input value to be fully updated
+  inputTimeout = setTimeout(() => {
+    // Save this specific input
+    saveSpecificInput(input);
+  }, 100); // Small delay to ensure value is captured
+}
+
+function saveSpecificInput(input) {
+  const rowIndex = parseInt(input.dataset.row);
+  const column = input.dataset.column;
+  const value = input.value.trim();
+  
+  // Find the table row that contains this input
+  const tableRow = input.closest('tr');
+  const rowInputs = tableRow.querySelectorAll('.annotation-input');
+  const rowData = {};
+  
+  rowInputs.forEach(input => {
+    const col = input.dataset.column;
+    const val = input.value.trim();
+    rowData[col] = val;
+  });
+  
+  // Handle multi-choice containers
+  const multiChoiceContainers = tableRow.querySelectorAll('.multi-choice-container');
+  multiChoiceContainers.forEach(container => {
+    const col = container.dataset.column;
+    const checkboxes = container.querySelectorAll('input[type="checkbox"]');
+    const selectedValues = Array.from(checkboxes)
+      .filter(cb => cb.checked)
+      .map(cb => cb.value);
+    rowData[col] = selectedValues.join(',');
+  });
+  
+  // Use the table row index instead of data-row attribute
+  const tableRows = document.querySelectorAll('tbody tr');
+  const actualRowIndex = Array.from(tableRows).indexOf(tableRow);
+  
+  const requestData = {
+    assignment_id: assignmentId,
+    row_index: actualRowIndex,
+    row_data: rowData
+  };
+  
+  // Save to temp file
+  fetch('/save_annotation_temp', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(requestData)
+  })
+  .then(response => response.json())
+  .then(data => {
+    if (data.success) {
+      const indicator = document.querySelector('.auto-save-indicator');
+      indicator.textContent = 'Saved ✓';
+      indicator.style.color = '#10b981';
+      setTimeout(() => {
+        indicator.textContent = 'Auto-save enabled ✓';
+        indicator.style.color = '#6b7280';
+      }, 2000);
+    } else {
+      console.error('Save failed:', data.error);
+    }
+  })
+  .catch(error => {
+    console.error('Save error:', error);
+  });
+}
+
+function saveMultiChoiceCell(checkbox) {
+  // Find the multi-choice container
+  const container = checkbox.closest('.multi-choice-container');
+  const tableRow = container.closest('tr');
+  const rowInputs = tableRow.querySelectorAll('.annotation-input');
+  const rowData = {};
+  
+  // Collect all regular input values
+  rowInputs.forEach(input => {
+    const col = input.dataset.column;
+    const val = input.value.trim();
+    rowData[col] = val;
+  });
+  
+  // Collect all multi-choice values
+  const multiChoiceContainers = tableRow.querySelectorAll('.multi-choice-container');
+  multiChoiceContainers.forEach(container => {
+    const col = container.dataset.column;
+    const checkboxes = container.querySelectorAll('input[type="checkbox"]');
+    const selectedValues = Array.from(checkboxes)
+      .filter(cb => cb.checked)
+      .map(cb => cb.value);
+    rowData[col] = selectedValues.join(',');
+  });
+  
+  // Use the table row index
+  const tableRows = document.querySelectorAll('tbody tr');
+  const actualRowIndex = Array.from(tableRows).indexOf(tableRow);
+  
+  const requestData = {
+    assignment_id: assignmentId,
+    row_index: actualRowIndex,
+    row_data: rowData
+  };
+  
+  // Save to temp file
+  fetch('/save_annotation_temp', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(requestData)
+  })
+  .then(response => response.json())
+  .then(data => {
+    if (data.success) {
+      const indicator = document.querySelector('.auto-save-indicator');
+      indicator.textContent = 'Saved ✓';
+      indicator.style.color = '#10b981';
+      setTimeout(() => {
+        indicator.textContent = 'Auto-save enabled ✓';
+        indicator.style.color = '#6b7280';
+      }, 2000);
+    } else {
+      console.error('Save failed:', data.error);
+    }
+  })
+  .catch(error => {
+    console.error('Save error:', error);
+  });
+}
+
+
+document.addEventListener('DOMContentLoaded', function() {
+  const indicator = document.getElementById('auto-save-indicator');
+  if (indicator) {
+    indicator.textContent = 'Auto-save enabled ✓';
+    indicator.style.color = '#6b7280';
+  }
+});
+</script>
+</body>
+</html>
