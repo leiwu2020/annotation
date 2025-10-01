@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  annotation-app:
+    build: .
+    container_name: annotation-webapp
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=production
+      - FLASK_APP=app.py
+    volumes:
+      # Persist database and uploads
+      - annotation_data:/app/instance
+      - annotation_uploads:/app/uploads
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  annotation_data:
+    driver: local
+  annotation_uploads:
+    driver: local
