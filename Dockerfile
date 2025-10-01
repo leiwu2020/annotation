@@ -9,6 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV FLASK_APP=app.py
 ENV FLASK_ENV=production
+ENV HOST=0.0.0.0
+ENV PORT=5000
 
 # Install system dependencies
 RUN apt-get update \
