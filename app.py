@@ -968,6 +968,75 @@ def delete_annotation_file(file_id):
     return redirect(url_for('dashboard'))
 
 
+@app.route('/admin/users')
+@login_required
+def manage_users():
+    """Admin interface to manage users"""
+    if not current_user.is_admin:
+        flash('Access denied. Admin privileges required.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    users = User.query.all()
+    return render_template('manage_users.html', users=users)
+
+@app.route('/admin/users/delete/<int:user_id>', methods=['POST'])
+@login_required
+def delete_user(user_id):
+    """Delete a user (admin only)"""
+    if not current_user.is_admin:
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    
+    if user_id == current_user.id:
+        return jsonify({'success': False, 'error': 'Cannot delete your own account'}), 400
+    
+    user = User.query.get_or_404(user_id)
+    
+    try:
+        # Delete user's assignments and files
+        assignments = AnnotationAssignment.query.filter_by(user_id=user_id).all()
+        for assignment in assignments:
+            # Delete user's CSV file if it exists
+            if assignment.user_file_path:
+                user_file_path = os.path.join(app.config['UPLOAD_FOLDER'], assignment.user_file_path)
+                if os.path.exists(user_file_path):
+                    os.remove(user_file_path)
+            db.session.delete(assignment)
+        
+        # Delete notifications related to this user
+        notifications = Notification.query.filter_by(admin_id=user_id).all()
+        for notification in notifications:
+            db.session.delete(notification)
+        
+        # Delete the user
+        db.session.delete(user)
+        db.session.commit()
+        
+        return jsonify({'success': True, 'message': f'User {user.username} deleted successfully'})
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/admin/users/reset_password/<int:user_id>', methods=['POST'])
+@login_required
+def reset_user_password(user_id):
+    """Reset a user's password (admin only)"""
+    if not current_user.is_admin:
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    
+    user = User.query.get_or_404(user_id)
+    new_password = request.json.get('new_password', 'password123')
+    
+    try:
+        user.set_password(new_password)
+        db.session.commit()
+        
+        return jsonify({'success': True, 'message': f'Password for {user.username} reset successfully'})
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/logout')
 @login_required
 def logout():

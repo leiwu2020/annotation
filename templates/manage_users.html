@@ -1,0 +1,222 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page-header">
+  <h1>User Management</h1>
+  <p>Manage user accounts, reset passwords, and delete users.</p>
+</div>
+
+<div class="user-management">
+  <div class="admin-actions">
+    <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Back to Dashboard</a>
+  </div>
+
+  <div class="users-table-container">
+    <table class="users-table">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Username</th>
+          <th>Email</th>
+          <th>Role</th>
+          <th>Status</th>
+          <th>Created</th>
+          <th>Last Login</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for user in users %}
+        <tr class="user-row" data-user-id="{{ user.id }}">
+          <td>{{ user.id }}</td>
+          <td>
+            <strong>{{ user.username }}</strong>
+            {% if user.id == current_user.id %}
+              <span class="current-user-badge">(You)</span>
+            {% endif %}
+          </td>
+          <td>{{ user.email if user.email else 'N/A' }}</td>
+          <td>
+            <span class="role-badge {% if user.is_admin %}admin{% else %}user{% endif %}">
+              {% if user.is_admin %}Admin{% else %}User{% endif %}
+            </span>
+          </td>
+          <td>
+            <span class="status-badge {% if user.is_approved %}approved{% else %}pending{% endif %}">
+              {% if user.is_approved %}Approved{% else %}Pending{% endif %}
+            </span>
+          </td>
+          <td>{{ user.created_at.strftime('%Y-%m-%d %H:%M') if user.created_at else 'N/A' }}</td>
+          <td>{{ user.last_login.strftime('%Y-%m-%d %H:%M') if user.last_login else 'Never' }}</td>
+          <td class="user-actions">
+            {% if user.id != current_user.id %}
+              <div class="action-buttons">
+                <button onclick="resetPassword({{ user.id }}, '{{ user.username }}')" 
+                        class="btn btn-warning btn-sm">Reset Password</button>
+                <button onclick="deleteUser({{ user.id }}, '{{ user.username }}')" 
+                        class="btn btn-danger btn-sm">Delete</button>
+              </div>
+            {% else %}
+              <span class="current-user-text">Current User</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Reset Password Modal -->
+<div id="resetPasswordModal" class="modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h2>Reset Password</h2>
+      <span class="close" onclick="closeResetPasswordModal()">&times;</span>
+    </div>
+    <div class="modal-body">
+      <p>Reset password for user: <strong id="resetUsername"></strong></p>
+      <div class="form-group">
+        <label for="newPassword">New Password:</label>
+        <input type="password" id="newPassword" class="form-control" placeholder="Enter new password" value="password123">
+        <small class="form-text">Default password is 'password123'. User should change this after login.</small>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeResetPasswordModal()" class="btn btn-secondary">Cancel</button>
+      <button onclick="confirmResetPassword()" class="btn btn-warning">Reset Password</button>
+    </div>
+  </div>
+</div>
+
+<!-- Delete User Modal -->
+<div id="deleteUserModal" class="modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h2>Delete User</h2>
+      <span class="close" onclick="closeDeleteUserModal()">&times;</span>
+    </div>
+    <div class="modal-body">
+      <p>Are you sure you want to delete user: <strong id="deleteUsername"></strong>?</p>
+      <div class="warning-box">
+        <strong>Warning:</strong> This action will permanently delete:
+        <ul>
+          <li>The user account</li>
+          <li>All annotation assignments</li>
+          <li>All associated CSV files</li>
+          <li>All related notifications</li>
+        </ul>
+        <p><strong>This action cannot be undone!</strong></p>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeDeleteUserModal()" class="btn btn-secondary">Cancel</button>
+      <button onclick="confirmDeleteUser()" class="btn btn-danger">Delete User</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentUserId = null;
+let currentUsername = '';
+
+function resetPassword(userId, username) {
+  currentUserId = userId;
+  currentUsername = username;
+  document.getElementById('resetUsername').textContent = username;
+  document.getElementById('newPassword').value = 'password123';
+  document.getElementById('resetPasswordModal').style.display = 'block';
+}
+
+function closeResetPasswordModal() {
+  document.getElementById('resetPasswordModal').style.display = 'none';
+  currentUserId = null;
+  currentUsername = '';
+}
+
+function confirmResetPassword() {
+  const newPassword = document.getElementById('newPassword').value;
+  
+  if (!newPassword.trim()) {
+    alert('Please enter a new password');
+    return;
+  }
+  
+  fetch(`/admin/users/reset_password/${currentUserId}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      new_password: newPassword
+    })
+  })
+  .then(response => response.json())
+  .then(data => {
+    if (data.success) {
+      alert(data.message);
+      closeResetPasswordModal();
+    } else {
+      alert('Error: ' + data.error);
+    }
+  })
+  .catch(error => {
+    console.error('Error:', error);
+    alert('An error occurred while resetting the password');
+  });
+}
+
+function deleteUser(userId, username) {
+  currentUserId = userId;
+  currentUsername = username;
+  document.getElementById('deleteUsername').textContent = username;
+  document.getElementById('deleteUserModal').style.display = 'block';
+}
+
+function closeDeleteUserModal() {
+  document.getElementById('deleteUserModal').style.display = 'none';
+  currentUserId = null;
+  currentUsername = '';
+}
+
+function confirmDeleteUser() {
+  fetch(`/admin/users/delete/${currentUserId}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    }
+  })
+  .then(response => response.json())
+  .then(data => {
+    if (data.success) {
+      alert(data.message);
+      // Remove the user row from the table
+      const userRow = document.querySelector(`tr[data-user-id="${currentUserId}"]`);
+      if (userRow) {
+        userRow.remove();
+      }
+      closeDeleteUserModal();
+    } else {
+      alert('Error: ' + data.error);
+    }
+  })
+  .catch(error => {
+    console.error('Error:', error);
+    alert('An error occurred while deleting the user');
+  });
+}
+
+// Close modals when clicking outside
+window.onclick = function(event) {
+  const resetModal = document.getElementById('resetPasswordModal');
+  const deleteModal = document.getElementById('deleteUserModal');
+  
+  if (event.target === resetModal) {
+    closeResetPasswordModal();
+  }
+  if (event.target === deleteModal) {
+    closeDeleteUserModal();
+  }
+}
+</script>
+{% endblock %}
