@@ -10,6 +10,7 @@ import json
 import pandas as pd
 import uuid
 import threading
+import re
 import time
 
 app = Flask(__name__)
@@ -49,13 +50,39 @@ class User(UserMixin, db.Model):
     phone = db.Column(db.String(20), nullable=False)
     is_approved = db.Column(db.Boolean, default=False)
     is_admin = db.Column(db.Boolean, default=False)
+    is_manager = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime, nullable=True)
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
+    
+    @property
+    def role(self):
+        """Get user role as string"""
+        if self.is_admin:
+            return 'admin'
+        elif self.is_manager:
+            return 'manager'
+        else:
+            return 'user'
+
+# UserManager model - tracks which users are assigned to which managers
+class UserManager(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    manager_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    assigned_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    manager = db.relationship('User', foreign_keys=[manager_id], backref='managed_users')
+    user = db.relationship('User', foreign_keys=[user_id], backref='managers')
+    
+    # Ensure unique manager-user relationships
+    __table_args__ = (db.UniqueConstraint('manager_id', 'user_id', name='unique_manager_user'),)
 
 # Annotation File model
 class AnnotationFile(db.Model):
@@ -65,12 +92,15 @@ class AnnotationFile(db.Model):
     file_path = db.Column(db.String(500), nullable=False)
     editable_columns = db.Column(db.Text, nullable=False)  # JSON string of editable column names
     column_configs = db.Column(db.Text, nullable=True)  # JSON string of column configurations (type, dropdown_values)
+    visible_columns = db.Column(db.Text, nullable=True)  # JSON string of visible column names
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    manager_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)  # Manager who owns this file
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     is_active = db.Column(db.Boolean, default=True)
     
     # Relationships
-    creator = db.relationship('User', backref='created_files')
+    creator = db.relationship('User', foreign_keys=[created_by], backref='created_files')
+    manager = db.relationship('User', foreign_keys=[manager_id], backref='managed_files')
     assignments = db.relationship('AnnotationAssignment', backref='annotation_file', cascade='all, delete-orphan')
 
 # Annotation Assignment model
@@ -91,13 +121,15 @@ class AnnotationAssignment(db.Model):
 
 class Notification(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    admin_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    admin_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)  # Can be null for manager notifications
+    manager_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)  # Can be null for admin notifications
     assignment_id = db.Column(db.Integer, db.ForeignKey('annotation_assignment.id'), nullable=False)
     message = db.Column(db.String(500), nullable=False)
     is_read = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
-    admin = db.relationship('User', backref='notifications')
+    admin = db.relationship('User', foreign_keys=[admin_id], backref='admin_notifications')
+    manager = db.relationship('User', foreign_keys=[manager_id], backref='manager_notifications')
     assignment = db.relationship('AnnotationAssignment', backref='notifications')
 
 @login_manager.user_loader
@@ -144,7 +176,14 @@ def create_user_copy(original_file_path, username, original_filename):
             df = pd.read_csv(original_file_path, dtype=str, keep_default_na=False, 
                            on_bad_lines='skip', engine='python')
         
-        df.to_csv(user_file_path, index=False, na_rep='', quoting=1)  # Use QUOTE_ALL
+        # Clean any existing multi-choice values to remove newlines
+        for col in df.columns:
+            df[col] = df[col].apply(lambda x: str(x).replace('\n', '').replace('\r', '') if pd.notna(x) else x)
+            df[col] = df[col].apply(lambda x: re.sub(r'\s*,\s*', ',', str(x)) if pd.notna(x) else x)
+            df[col] = df[col].apply(lambda x: re.sub(r',+', ',', str(x)) if pd.notna(x) else x)
+            df[col] = df[col].apply(lambda x: str(x).strip(', ').strip() if pd.notna(x) else x)
+        
+        df.to_csv(user_file_path, index=False, na_rep='', quoting=1, escapechar='\\')  # Use QUOTE_ALL
         
         # Return relative path for database storage
         relative_path = os.path.relpath(user_file_path, app.config['UPLOAD_FOLDER'])
@@ -257,13 +296,22 @@ def login():
 @login_required
 def dashboard():
     if current_user.is_admin:
-        # Admin dashboard - show pending users and annotation files
-        pending_users = User.query.filter_by(is_approved=False, is_admin=False).all()
+        # Admin dashboard - show pending users and all annotation files
+        pending_users = User.query.filter_by(is_approved=False, is_admin=False, is_manager=False).all()
         annotation_files = AnnotationFile.query.filter_by(is_active=True).all()
         assignments = AnnotationAssignment.query.join(AnnotationFile).filter(AnnotationFile.is_active==True).all()
         notifications = Notification.query.filter_by(admin_id=current_user.id, is_read=False).order_by(Notification.created_at.desc()).all()
         return render_template('admin_dashboard.html', user=current_user, pending_users=pending_users, 
                              annotation_files=annotation_files, assignments=assignments, notifications=notifications)
+    elif current_user.is_manager:
+        # Manager dashboard - show only their files and assignments
+        manager_files = get_manager_files(current_user.id)
+        manager_assignments = get_manager_assignments(current_user.id)
+        managed_users = get_manager_users(current_user.id)
+        notifications = Notification.query.filter_by(manager_id=current_user.id, is_read=False).order_by(Notification.created_at.desc()).all()
+        return render_template('manager_dashboard.html', user=current_user, 
+                             annotation_files=manager_files, assignments=manager_assignments, 
+                             managed_users=managed_users, notifications=notifications)
     else:
         # Regular user dashboard - show assigned annotation tasks
         user_assignments = AnnotationAssignment.query.filter_by(user_id=current_user.id).join(AnnotationFile).filter(AnnotationFile.is_active==True).all()
@@ -298,8 +346,8 @@ def reject_user(user_id):
 @app.route('/admin/upload', methods=['GET', 'POST'])
 @login_required
 def upload_file():
-    if not current_user.is_admin:
-        flash('Access denied. Admin privileges required.', 'error')
+    if not (current_user.is_admin or current_user.is_manager):
+        flash('Access denied. Admin or Manager privileges required.', 'error')
         return redirect(url_for('dashboard'))
     
     if request.method == 'POST':
@@ -333,7 +381,8 @@ def upload_file():
                 original_filename=file.filename,
                 file_path=file_path,
                 editable_columns=json.dumps(columns),  # Initially all columns are editable
-                created_by=current_user.id
+                created_by=current_user.id,
+                manager_id=current_user.id if current_user.is_manager else None
             )
             db.session.add(annotation_file)
             db.session.commit()
@@ -348,11 +397,16 @@ def upload_file():
 @app.route('/admin/configure/<int:file_id>', methods=['GET', 'POST'])
 @login_required
 def configure_file(file_id):
-    if not current_user.is_admin:
-        flash('Access denied. Admin privileges required.', 'error')
+    if not (current_user.is_admin or current_user.is_manager):
+        flash('Access denied. Admin or Manager privileges required.', 'error')
         return redirect(url_for('dashboard'))
     
     annotation_file = AnnotationFile.query.get_or_404(file_id)
+    
+    # Check if user can access this file
+    if not can_user_access_file(current_user.id, file_id):
+        flash('Access denied. You can only configure files you own.', 'error')
+        return redirect(url_for('dashboard'))
     
     # Get all columns from the CSV file
     df = pd.read_csv(annotation_file.file_path)
@@ -362,12 +416,15 @@ def configure_file(file_id):
     try:
         editable_columns = json.loads(annotation_file.editable_columns) if annotation_file.editable_columns else []
         column_configs = json.loads(annotation_file.column_configs) if annotation_file.column_configs else {}
+        visible_columns = json.loads(annotation_file.visible_columns) if annotation_file.visible_columns else all_columns
     except:
         editable_columns = []
         column_configs = {}
+        visible_columns = all_columns
     
     if request.method == 'POST':
         editable_columns = request.form.getlist('editable_columns')
+        visible_columns = request.form.getlist('visible_columns')
         column_configs = {}
         
         # Process column configurations
@@ -384,6 +441,7 @@ def configure_file(file_id):
         
         annotation_file.editable_columns = json.dumps(editable_columns)
         annotation_file.column_configs = json.dumps(column_configs)
+        annotation_file.visible_columns = json.dumps(visible_columns)
         db.session.commit()
         flash('File configuration updated successfully!', 'success')
         return redirect(url_for('dashboard'))
@@ -392,17 +450,28 @@ def configure_file(file_id):
                          annotation_file=annotation_file, 
                          columns=all_columns,
                          editable_columns=editable_columns,
+                         visible_columns=visible_columns,
                          column_configs=column_configs)
 
 @app.route('/admin/assign/<int:file_id>', methods=['GET', 'POST'])
 @login_required
 def assign_file(file_id):
-    if not current_user.is_admin:
-        flash('Access denied. Admin privileges required.', 'error')
+    if not (current_user.is_admin or current_user.is_manager):
+        flash('Access denied. Admin or Manager privileges required.', 'error')
         return redirect(url_for('dashboard'))
     
     annotation_file = AnnotationFile.query.get_or_404(file_id)
-    approved_users = User.query.filter_by(is_approved=True, is_admin=False).all()
+    
+    # Check if user can access this file
+    if not can_user_access_file(current_user.id, file_id):
+        flash('Access denied. You can only assign files you own.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    # Get users based on role
+    if current_user.is_admin:
+        approved_users = User.query.filter_by(is_approved=True, is_admin=False, is_manager=False).all()
+    else:  # Manager
+        approved_users = get_manager_users(current_user.id)
     
     if request.method == 'POST':
         user_ids = request.form.getlist('user_ids')
@@ -437,6 +506,7 @@ def assign_file(file_id):
 @app.route('/annotate/<int:assignment_id>')
 @login_required
 def annotate_file(assignment_id):
+    # print(f"DEBUG: annotate_file called for assignment_id={assignment_id}, user={current_user.username}")
     assignment = AnnotationAssignment.query.get_or_404(assignment_id)
     
     # Check if user owns this assignment
@@ -474,6 +544,8 @@ def annotate_file(assignment_id):
     
     # Check if the user file actually exists on disk
     full_user_file_path = os.path.join(app.config['UPLOAD_FOLDER'], user_file_relative_path)
+    # print(f"DEBUG: Loading annotation file: {full_user_file_path}")
+    # print(f"DEBUG: User file exists: {os.path.exists(full_user_file_path)}")
     if not os.path.exists(full_user_file_path):
         # Recreate user copy if file is missing
         user_file_relative_path = create_user_copy(assignment.annotation_file.file_path, current_user.username, assignment.annotation_file.original_filename)
@@ -489,19 +561,30 @@ def annotate_file(assignment_id):
     try:
         # Read CSV with string dtype and proper handling of empty values and malformed CSV
         try:
-            df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False)
+            df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False, quoting=1)
         except pd.errors.ParserError as e:
             print(f"CSV parsing error in user file, trying with error handling: {e}")
             # Try with more lenient parsing
             df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False, 
-                           on_bad_lines='skip', engine='python')
+                           on_bad_lines='skip', engine='python', quoting=1)
         editable_columns = json.loads(assignment.annotation_file.editable_columns)
         column_configs = json.loads(assignment.annotation_file.column_configs) if assignment.annotation_file.column_configs else {}
-        data = df.to_dict('records')
+        visible_columns = json.loads(assignment.annotation_file.visible_columns) if assignment.annotation_file.visible_columns else df.columns.tolist()
+        
+        # Clean column configs to remove newlines from values
+        for column, config in column_configs.items():
+            if 'dropdown_values' in config:
+                config['dropdown_values'] = [v.replace('\n', '').replace('\r', '').strip() for v in config['dropdown_values']]
+            if 'multi_choice_values' in config:
+                config['multi_choice_values'] = [v.replace('\n', '').replace('\r', '').strip() for v in config['multi_choice_values']]
+        
+        # Filter data to only include visible columns
+        filtered_df = df[visible_columns] if visible_columns else df
+        data = filtered_df.to_dict('records')
         
         # File loaded successfully
         return render_template('annotate.html', assignment=assignment, data=data, 
-                             editable_columns=editable_columns, columns=df.columns.tolist(),
+                             editable_columns=editable_columns, columns=visible_columns,
                              column_configs=column_configs)
     except Exception as e:
         print(f"Error reading CSV file: {e}")
@@ -556,9 +639,22 @@ def save_annotation_temp():
                         if value is None or value == '' or str(value).lower() == 'nan':
                             df.at[row_index, column] = ''
                         else:
-                            df.at[row_index, column] = str(value)
+                            # Clean the value to remove any newlines or extra whitespace
+                            cleaned_value = str(value).replace('\n', '').replace('\r', '')
+                            # Clean up comma separation
+                            cleaned_value = re.sub(r'\s*,\s*', ',', cleaned_value)
+                            cleaned_value = re.sub(r',+', ',', cleaned_value)
+                            cleaned_value = cleaned_value.strip(', ').strip()
+                            df.at[row_index, column] = cleaned_value
                 
-                df.to_csv(user_file_path, index=False, na_rep='', quoting=1)
+                # Use QUOTE_ALL to ensure all fields are quoted, preventing CSV parsing issues
+                df.to_csv(user_file_path, index=False, na_rep='', quoting=1, escapechar='\\')
+                
+                # Debug: Print what was saved (only for non-empty data and meaningful changes)
+                non_empty_data = {k: v for k, v in row_data.items() if v and str(v).strip()}
+                if non_empty_data:
+                    print(f"Auto-saved row {row_index} for user {current_user.username}: {non_empty_data}")
+                
                 return jsonify({'success': True, 'message': 'Auto-saved to user file'})
             else:
                 return jsonify({'error': 'Invalid row index'}), 400
@@ -585,7 +681,8 @@ def complete_annotation(assignment_id):
         assignment.status = 'completed'
         assignment.completed_at = datetime.utcnow()
         
-        # Create notifications for all admins
+        # Create notifications for admins and the file manager
+        # Notify all admins
         admins = User.query.filter_by(is_admin=True).all()
         for admin in admins:
             notification = Notification(
@@ -594,6 +691,21 @@ def complete_annotation(assignment_id):
                 message=f"User {current_user.first_name} {current_user.last_name} completed annotation task for file '{assignment.annotation_file.original_filename}'"
             )
             db.session.add(notification)
+        
+        # Notify the file manager if different from admin
+        if assignment.annotation_file.manager_id:
+            try:
+                manager = User.query.get(assignment.annotation_file.manager_id)
+                if manager and not manager.is_admin:
+                    notification = Notification(
+                        manager_id=manager.id,
+                        assignment_id=assignment.id,
+                        message=f"User {current_user.first_name} {current_user.last_name} completed annotation task for file '{assignment.annotation_file.original_filename}'"
+                    )
+                    db.session.add(notification)
+            except Exception as e:
+                print(f"Error creating manager notification: {e}")
+                # Continue without manager notification
         
         db.session.commit()
         
@@ -614,13 +726,13 @@ def complete_annotation(assignment_id):
 @login_required
 def mark_notification_read(notification_id):
     """Mark a notification as read"""
-    if not current_user.is_admin:
+    if not (current_user.is_admin or current_user.is_manager):
         return jsonify({'error': 'Access denied'}), 403
     
     notification = Notification.query.get_or_404(notification_id)
     
-    # Check if notification belongs to current admin
-    if notification.admin_id != current_user.id:
+    # Check if notification belongs to current user (admin or manager)
+    if (notification.admin_id != current_user.id and notification.manager_id != current_user.id):
         return jsonify({'error': 'Access denied'}), 403
     
     try:
@@ -635,10 +747,14 @@ def mark_notification_read(notification_id):
 @login_required
 def restart_assignment(assignment_id):
     """Restart a completed assignment"""
-    if not current_user.is_admin:
-        return jsonify({'error': 'Admin access required'}), 403
+    if not (current_user.is_admin or current_user.is_manager):
+        return jsonify({'error': 'Admin or Manager access required'}), 403
     
     assignment = AnnotationAssignment.query.get_or_404(assignment_id)
+    
+    # Check if user can access this assignment
+    if not can_user_access_assignment(current_user.id, assignment_id):
+        return jsonify({'error': 'Access denied. You can only restart assignments you own.'}), 403
     
     try:
         # Reset the assignment status
@@ -665,10 +781,14 @@ def restart_assignment(assignment_id):
 @login_required
 def delete_assignment(assignment_id):
     """Delete an assignment and its associated files"""
-    if not current_user.is_admin:
-        return jsonify({'error': 'Admin access required'}), 403
+    if not (current_user.is_admin or current_user.is_manager):
+        return jsonify({'error': 'Admin or Manager access required'}), 403
     
     assignment = AnnotationAssignment.query.get_or_404(assignment_id)
+    
+    # Check if user can access this assignment
+    if not can_user_access_assignment(current_user.id, assignment_id):
+        return jsonify({'error': 'Access denied. You can only delete assignments you own.'}), 403
     
     try:
         # Delete the user's CSV file if it exists
@@ -701,8 +821,8 @@ def delete_assignment(assignment_id):
 @login_required
 def evaluate_annotations():
     """Annotation evaluation interface for comparing multiple assignments"""
-    if not current_user.is_admin:
-        flash('Access denied. Admin privileges required.', 'error')
+    if not (current_user.is_admin or current_user.is_manager):
+        flash('Access denied. Admin or Manager privileges required.', 'error')
         return redirect(url_for('dashboard'))
     
     if request.method == 'POST':
@@ -722,13 +842,23 @@ def evaluate_annotations():
         # Calculate overlap rates
         evaluation_results = calculate_overlap_rates(assignments)
         
+        # Get available assignments based on role
+        if current_user.is_admin:
+            all_assignments = get_available_assignments()
+        else:  # Manager
+            all_assignments = [a for a in get_manager_assignments(current_user.id) if a.status == 'completed']
+        
         return render_template('annotation_evaluation.html', 
                              assignments=assignments, 
                              evaluation_results=evaluation_results,
-                             all_assignments=get_available_assignments())
+                             all_assignments=all_assignments)
     
     # GET request - show selection interface
-    all_assignments = get_available_assignments()
+    if current_user.is_admin:
+        all_assignments = get_available_assignments()
+    else:  # Manager
+        all_assignments = [a for a in get_manager_assignments(current_user.id) if a.status == 'completed']
+    
     return render_template('annotation_evaluation.html', 
                          assignments=[], 
                          evaluation_results=[],
@@ -740,6 +870,65 @@ def get_available_assignments():
         AnnotationAssignment.status == 'completed',
         AnnotationFile.is_active == True
     ).all()
+
+def get_manager_assignments(manager_id):
+    """Get all assignments for files owned by a specific manager"""
+    return AnnotationAssignment.query.join(AnnotationFile).filter(
+        AnnotationFile.manager_id == manager_id,
+        AnnotationFile.is_active == True
+    ).all()
+
+def get_manager_files(manager_id):
+    """Get all files owned by a specific manager"""
+    return AnnotationFile.query.filter(
+        AnnotationFile.manager_id == manager_id,
+        AnnotationFile.is_active == True
+    ).all()
+
+def get_manager_users(manager_id):
+    """Get all users assigned to a specific manager"""
+    user_managers = UserManager.query.filter_by(manager_id=manager_id).all()
+    return [um.user for um in user_managers]
+
+def can_user_access_file(user_id, file_id):
+    """Check if a user can access a specific file based on role hierarchy"""
+    user = User.query.get(user_id)
+    if not user:
+        return False
+    
+    # Admin can access all files
+    if user.is_admin:
+        return True
+    
+    # Manager can access their own files
+    if user.is_manager:
+        file = AnnotationFile.query.get(file_id)
+        return file and file.manager_id == user_id
+    
+    # Regular user can access files assigned to them
+    assignment = AnnotationAssignment.query.filter_by(user_id=user_id, file_id=file_id).first()
+    return assignment is not None
+
+def can_user_access_assignment(user_id, assignment_id):
+    """Check if a user can access a specific assignment based on role hierarchy"""
+    user = User.query.get(user_id)
+    if not user:
+        return False
+    
+    assignment = AnnotationAssignment.query.get(assignment_id)
+    if not assignment:
+        return False
+    
+    # Admin can access all assignments
+    if user.is_admin:
+        return True
+    
+    # Manager can access assignments for their files
+    if user.is_manager:
+        return assignment.annotation_file.manager_id == user_id
+    
+    # Regular user can access their own assignments
+    return assignment.user_id == user_id
 
 def calculate_overlap_rates(assignments):
     """Calculate overlap rates between annotation assignments"""
@@ -898,14 +1087,47 @@ def save_annotation():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/admin/download_file/<int:file_id>')
+@login_required
+def download_file(file_id):
+    """Download the original CSV file"""
+    if not (current_user.is_admin or current_user.is_manager):
+        flash('Access denied. Admin or Manager privileges required.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    annotation_file = AnnotationFile.query.get_or_404(file_id)
+    
+    # Check if user can access this file
+    if not can_user_access_file(current_user.id, file_id):
+        flash('Access denied. You can only download files you own.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    try:
+        # Check if file exists
+        if not os.path.exists(annotation_file.file_path):
+            flash('File not found.', 'error')
+            return redirect(url_for('dashboard'))
+        
+        return send_file(annotation_file.file_path, 
+                       as_attachment=True, 
+                       download_name=annotation_file.original_filename)
+    except Exception as e:
+        flash(f'Error downloading file: {str(e)}', 'error')
+        return redirect(url_for('dashboard'))
+
 @app.route('/admin/download/<int:assignment_id>')
 @login_required
 def download_annotation(assignment_id):
-    if not current_user.is_admin:
-        flash('Access denied. Admin privileges required.', 'error')
+    if not (current_user.is_admin or current_user.is_manager):
+        flash('Access denied. Admin or Manager privileges required.', 'error')
         return redirect(url_for('dashboard'))
     
     assignment = AnnotationAssignment.query.get_or_404(assignment_id)
+    
+    # Check if user can access this assignment
+    if not can_user_access_assignment(current_user.id, assignment_id):
+        flash('Access denied. You can only download assignments you own.', 'error')
+        return redirect(url_for('dashboard'))
     
     if assignment.status != 'completed':
         flash('Annotation not completed yet.', 'error')
@@ -1042,6 +1264,180 @@ def reset_user_password(user_id):
 def logout():
     logout_user()
     return redirect(url_for('index'))
+
+# Manager Management Routes
+@app.route('/admin/managers')
+@login_required
+def manage_managers():
+    """Admin interface to manage managers and assign users"""
+    if not current_user.is_admin:
+        flash('Access denied. Admin privileges required.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    managers = User.query.filter_by(is_manager=True).all()
+    all_users = User.query.filter_by(is_admin=False, is_manager=False, is_approved=True).all()
+    
+    # Get manager-user assignments
+    manager_assignments = {}
+    for manager in managers:
+        managed_users = get_manager_users(manager.id)
+        manager_assignments[manager.id] = managed_users
+    
+    # Convert User objects to dictionaries for JSON serialization
+    managers_data = []
+    for manager in managers:
+        managers_data.append({
+            'id': manager.id,
+            'username': manager.username,
+            'first_name': manager.first_name,
+            'last_name': manager.last_name,
+            'email': manager.email,
+            'organization': manager.organization,
+            'created_at': manager.created_at.isoformat() if manager.created_at else None
+        })
+    
+    all_users_data = []
+    for user in all_users:
+        all_users_data.append({
+            'id': user.id,
+            'username': user.username,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'email': user.email,
+            'organization': user.organization
+        })
+    
+    # Convert managed users to dictionaries
+    manager_assignments_data = {}
+    for manager_id, managed_users in manager_assignments.items():
+        manager_assignments_data[manager_id] = []
+        for user in managed_users:
+            manager_assignments_data[manager_id].append({
+                'id': user.id,
+                'username': user.username,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'email': user.email,
+                'organization': user.organization
+            })
+    
+    return render_template('manage_managers.html', 
+                         managers=managers, 
+                         all_users=all_users, 
+                         manager_assignments=manager_assignments,
+                         managers_data=managers_data,
+                         all_users_data=all_users_data,
+                         manager_assignments_data=manager_assignments_data)
+
+@app.route('/admin/managers/create_manager', methods=['POST'])
+@login_required
+def create_manager():
+    """Create a new manager (admin only)"""
+    if not current_user.is_admin:
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password', 'manager123')
+    
+    if not username:
+        return jsonify({'success': False, 'error': 'Username is required'}), 400
+    
+    # Check if user exists
+    existing_user = User.query.filter_by(username=username).first()
+    if existing_user:
+        if existing_user.is_manager:
+            return jsonify({'success': False, 'error': 'User is already a manager'}), 400
+        else:
+            # Promote existing user to manager
+            existing_user.is_manager = True
+            existing_user.is_approved = True
+            if password != 'manager123':
+                existing_user.set_password(password)
+            db.session.commit()
+            return jsonify({'success': True, 'message': f'User {username} promoted to manager'})
+    else:
+        # Create new manager user
+        manager = User(
+            username=username,
+            email=data.get('email', f'{username}@manager.com'),
+            first_name=data.get('first_name', 'Manager'),
+            last_name=data.get('last_name', 'User'),
+            organization=data.get('organization', 'Organization'),
+            position=data.get('position', 'Manager'),
+            phone=data.get('phone', 'N/A'),
+            is_manager=True,
+            is_approved=True
+        )
+        manager.set_password(password)
+        db.session.add(manager)
+        db.session.commit()
+        return jsonify({'success': True, 'message': f'Manager {username} created successfully'})
+
+@app.route('/admin/managers/assign_users/<int:manager_id>', methods=['POST'])
+@login_required
+def assign_users_to_manager(manager_id):
+    """Assign users to a manager (admin only)"""
+    if not current_user.is_admin:
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    
+    manager = User.query.get_or_404(manager_id)
+    if not manager.is_manager:
+        return jsonify({'success': False, 'error': 'User is not a manager'}), 400
+    
+    data = request.get_json()
+    user_ids = data.get('user_ids', [])
+    
+    try:
+        # Remove existing assignments for this manager
+        UserManager.query.filter_by(manager_id=manager_id).delete()
+        
+        # Add new assignments
+        for user_id in user_ids:
+            user = User.query.get(user_id)
+            if user and not user.is_admin and not user.is_manager:
+                user_manager = UserManager(manager_id=manager_id, user_id=user_id)
+                db.session.add(user_manager)
+        
+        db.session.commit()
+        return jsonify({'success': True, 'message': f'Users assigned to manager {manager.username}'})
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/admin/managers/remove_manager/<int:manager_id>', methods=['POST'])
+@login_required
+def remove_manager(manager_id):
+    """Remove manager role from user (admin only)"""
+    if not current_user.is_admin:
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    
+    if manager_id == current_user.id:
+        return jsonify({'success': False, 'error': 'Cannot remove your own manager role'}), 400
+    
+    manager = User.query.get_or_404(manager_id)
+    if not manager.is_manager:
+        return jsonify({'success': False, 'error': 'User is not a manager'}), 400
+    
+    try:
+        # Remove user-manager relationships
+        UserManager.query.filter_by(manager_id=manager_id).delete()
+        
+        # Transfer file ownership to admin or deactivate
+        files = get_manager_files(manager_id)
+        for file in files:
+            file.manager_id = current_user.id  # Transfer to admin
+        
+        # Remove manager role
+        manager.is_manager = False
+        
+        db.session.commit()
+        return jsonify({'success': True, 'message': f'Manager role removed from {manager.username}'})
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     with app.app_context():

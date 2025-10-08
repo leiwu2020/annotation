@@ -1,0 +1,336 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Manage Managers</h1>
+    <p>Create manager accounts and assign users to managers for project management.</p>
+</div>
+
+<!-- Create New Manager -->
+<div class="create-manager-section">
+    <h3>Create New Manager</h3>
+    <div class="create-manager-form">
+        <div class="form-group">
+            <label for="managerUsername">Username:</label>
+            <input type="text" id="managerUsername" class="form-control" placeholder="Enter username">
+        </div>
+        <div class="form-group">
+            <label for="managerPassword">Password (optional, default: manager123):</label>
+            <input type="password" id="managerPassword" class="form-control" placeholder="Enter password">
+        </div>
+        <div class="form-group">
+            <label for="managerEmail">Email:</label>
+            <input type="email" id="managerEmail" class="form-control" placeholder="Enter email">
+        </div>
+        <div class="form-group">
+            <label for="managerFirstName">First Name:</label>
+            <input type="text" id="managerFirstName" class="form-control" placeholder="Enter first name">
+        </div>
+        <div class="form-group">
+            <label for="managerLastName">Last Name:</label>
+            <input type="text" id="managerLastName" class="form-control" placeholder="Enter last name">
+        </div>
+        <div class="form-group">
+            <label for="managerOrganization">Organization:</label>
+            <input type="text" id="managerOrganization" class="form-control" placeholder="Enter organization">
+        </div>
+        <div class="form-group">
+            <label for="managerPosition">Position:</label>
+            <input type="text" id="managerPosition" class="form-control" placeholder="Enter position">
+        </div>
+        <div class="form-group">
+            <label for="managerPhone">Phone:</label>
+            <input type="text" id="managerPhone" class="form-control" placeholder="Enter phone">
+        </div>
+        <button onclick="createManager()" class="btn btn-primary">Create Manager</button>
+    </div>
+</div>
+
+<!-- Managers List -->
+<div class="managers-section">
+    <h3>Existing Managers ({{ managers|length }})</h3>
+    {% if managers %}
+    <div class="managers-table-container">
+        <table class="managers-table">
+            <thead>
+                <tr>
+                    <th>Username</th>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Organization</th>
+                    <th>Assigned Users</th>
+                    <th>Created</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for manager in managers %}
+                <tr>
+                    <td>{{ manager.username }}</td>
+                    <td>{{ manager.first_name }} {{ manager.last_name }}</td>
+                    <td>{{ manager.email }}</td>
+                    <td>{{ manager.organization }}</td>
+                    <td>
+                        {% set assigned_users = manager_assignments.get(manager.id, []) %}
+                        <span class="assigned-users-count">{{ assigned_users|length }} users</span>
+                        {% if assigned_users %}
+                        <button onclick="showAssignedUsers({{ manager.id }}, '{{ manager.username }}')" class="btn btn-sm btn-info">View</button>
+                        {% endif %}
+                    </td>
+                    <td>{{ manager.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td class="manager-actions">
+                        <div class="action-buttons">
+                            <button onclick="assignUsers({{ manager.id }}, '{{ manager.username }}')" class="btn btn-warning btn-sm">Assign Users</button>
+                            <button onclick="removeManager({{ manager.id }}, '{{ manager.username }}')" class="btn btn-danger btn-sm">Remove Role</button>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <p>No managers created yet. Create your first manager above.</p>
+    </div>
+    {% endif %}
+</div>
+
+<!-- Assign Users Modal -->
+<div id="assignUsersModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2>Assign Users to Manager: <span id="assignManagerName"></span></h2>
+            <span class="close" onclick="closeModal('assignUsersModal')">&times;</span>
+        </div>
+        <div class="modal-body">
+            <p>Select users to assign to this manager:</p>
+            <div class="users-selection">
+                {% for user in all_users %}
+                <div class="user-selection-item">
+                    <label>
+                        <input type="checkbox" class="user-checkbox" value="{{ user.id }}" data-username="{{ user.username }}">
+                        <strong>{{ user.username }}</strong> - {{ user.first_name }} {{ user.last_name }} ({{ user.organization }})
+                    </label>
+                </div>
+                {% endfor %}
+            </div>
+            <input type="hidden" id="assignManagerId">
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('assignUsersModal')">Cancel</button>
+            <button class="btn btn-primary" onclick="confirmAssignUsers()">Assign Users</button>
+        </div>
+    </div>
+</div>
+
+<!-- Assigned Users Modal -->
+<div id="assignedUsersModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2>Users Assigned to Manager: <span id="assignedManagerName"></span></h2>
+            <span class="close" onclick="closeModal('assignedUsersModal')">&times;</span>
+        </div>
+        <div class="modal-body">
+            <div id="assignedUsersList">
+                <!-- Populated by JavaScript -->
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('assignedUsersModal')">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Remove Manager Modal -->
+<div id="removeManagerModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2>Remove Manager Role</h2>
+            <span class="close" onclick="closeModal('removeManagerModal')">&times;</span>
+        </div>
+        <div class="modal-body">
+            <p>Are you sure you want to remove the manager role from <strong id="removeManagerName"></strong>?</p>
+            <div class="warning-box">
+                <strong>Warning:</strong> This will:
+                <ul>
+                    <li>Remove the manager role from the user.</li>
+                    <li>Unassign all users from this manager.</li>
+                    <li>Transfer ownership of all their files to you (admin).</li>
+                </ul>
+                <p>This action cannot be undone.</p>
+            </div>
+            <input type="hidden" id="removeManagerId">
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('removeManagerModal')">Cancel</button>
+            <button class="btn btn-danger" onclick="confirmRemoveManager()">Remove Manager Role</button>
+        </div>
+    </div>
+</div>
+
+<script>
+const managerAssignments = {{ manager_assignments_data | tojson }};
+const allUsers = {{ all_users_data | tojson }};
+
+function createManager() {
+    const username = document.getElementById('managerUsername').value;
+    const password = document.getElementById('managerPassword').value;
+    const email = document.getElementById('managerEmail').value;
+    const firstName = document.getElementById('managerFirstName').value;
+    const lastName = document.getElementById('managerLastName').value;
+    const organization = document.getElementById('managerOrganization').value;
+    const position = document.getElementById('managerPosition').value;
+    const phone = document.getElementById('managerPhone').value;
+
+    if (!username) {
+        alert('Username is required');
+        return;
+    }
+
+    fetch('/admin/managers/create_manager', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            username: username,
+            password: password,
+            email: email,
+            first_name: firstName,
+            last_name: lastName,
+            organization: organization,
+            position: position,
+            phone: phone
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert(data.message);
+            location.reload();
+        } else {
+            alert('Error: ' + data.error);
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('An error occurred while creating the manager.');
+    });
+}
+
+function assignUsers(managerId, managerUsername) {
+    document.getElementById('assignManagerId').value = managerId;
+    document.getElementById('assignManagerName').textContent = managerUsername;
+    
+    // Clear previous selections
+    document.querySelectorAll('.user-checkbox').forEach(checkbox => {
+        checkbox.checked = false;
+    });
+    
+    // Check currently assigned users
+    const assignedUsers = managerAssignments[managerId] || [];
+    assignedUsers.forEach(user => {
+        const checkbox = document.querySelector(`input[value="${user.id}"]`);
+        if (checkbox) {
+            checkbox.checked = true;
+        }
+    });
+    
+    openModal('assignUsersModal');
+}
+
+function confirmAssignUsers() {
+    const managerId = document.getElementById('assignManagerId').value;
+    const selectedUserIds = Array.from(document.querySelectorAll('.user-checkbox:checked'))
+        .map(checkbox => parseInt(checkbox.value));
+
+    fetch(`/admin/managers/assign_users/${managerId}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            user_ids: selectedUserIds
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert(data.message);
+            closeModal('assignUsersModal');
+            location.reload();
+        } else {
+            alert('Error: ' + data.error);
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('An error occurred while assigning users.');
+    });
+}
+
+function showAssignedUsers(managerId, managerUsername) {
+    document.getElementById('assignedManagerName').textContent = managerUsername;
+    
+    const assignedUsers = managerAssignments[managerId] || [];
+    const usersListHtml = assignedUsers.map(user => 
+        `<div class="assigned-user-item">
+            <strong>${user.username}</strong> - ${user.first_name} ${user.last_name}<br>
+            <small>${user.email} (${user.organization})</small>
+        </div>`
+    ).join('');
+    
+    document.getElementById('assignedUsersList').innerHTML = 
+        usersListHtml || '<p>No users assigned to this manager.</p>';
+    
+    openModal('assignedUsersModal');
+}
+
+function removeManager(managerId, managerUsername) {
+    document.getElementById('removeManagerId').value = managerId;
+    document.getElementById('removeManagerName').textContent = managerUsername;
+    openModal('removeManagerModal');
+}
+
+function confirmRemoveManager() {
+    const managerId = document.getElementById('removeManagerId').value;
+    
+    fetch(`/admin/managers/remove_manager/${managerId}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert(data.message);
+            closeModal('removeManagerModal');
+            location.reload();
+        } else {
+            alert('Error: ' + data.error);
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('An error occurred while removing the manager role.');
+    });
+}
+
+function openModal(modalId) {
+    document.getElementById(modalId).style.display = 'block';
+}
+
+function closeModal(modalId) {
+    document.getElementById(modalId).style.display = 'none';
+}
+
+// Close modals if user clicks outside
+window.onclick = function(event) {
+    if (event.target.classList.contains('modal')) {
+        event.target.style.display = 'none';
+    }
+}
+</script>
+{% endblock %}

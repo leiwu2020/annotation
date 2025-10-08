@@ -3,11 +3,28 @@
 {% block content %}
 <div class="page-header">
   <h1>Configure File: {{ annotation_file.original_filename }}</h1>
-  <p>Select which columns users can edit and configure their input type.</p>
+  <p>Configure column visibility and select which columns users can edit with their input types.</p>
 </div>
 
 <div class="configure-form">
   <form method="POST">
+    <div class="form-group">
+      <label>Column Visibility:</label>
+      <div class="column-visibility-list">
+        {% for column in columns %}
+        <div class="visibility-item">
+          <input type="checkbox" 
+                 id="visible_{{ loop.index }}" 
+                 name="visible_columns" 
+                 value="{{ column }}" 
+                 {% if column in visible_columns %}checked{% endif %}>
+          <label for="visible_{{ loop.index }}"><strong>{{ column }}</strong></label>
+        </div>
+        {% endfor %}
+      </div>
+      <small class="form-text">Select which columns should be visible to users during annotation.</small>
+    </div>
+    
     <div class="form-group">
       <label>Column Configuration:</label>
       <div class="column-config-list">
@@ -74,7 +91,7 @@
         </div>
         {% endfor %}
       </div>
-      <small class="form-text">Check the columns that users should be able to edit and configure their input type.</small>
+      <small class="form-text">Check the columns that users should be able to edit and configure their input type. Only visible columns will appear in the annotation interface.</small>
     </div>
     
     <div class="form-actions">
