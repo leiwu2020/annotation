@@ -15,8 +15,12 @@ ENV PORT=5000
 # Install system dependencies
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        gcc \
+        build-essential \
         python3-dev \
+        curl \
+        libjpeg62-turbo-dev \
+        libopenjp2-7 \
+        libopenjp2-7-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching

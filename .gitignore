@@ -134,3 +134,26 @@ uploads/
 
 # Database files (will be created at runtime)
 instance/*.db
+*.db
+
+# SSH Keys and certificates
+*.pem
+*.key
+
+# Docker images and archives
+*.tar.gz
+*.tar
+
+# CSV data files (sample/test data)
+*.csv
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
