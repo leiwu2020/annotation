@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, session, send_file, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, session, send_file, jsonify, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -12,6 +12,16 @@ import uuid
 import threading
 import re
 import time
+import boto3
+from botocore.exceptions import ClientError, TokenRetrievalError, CredentialRetrievalError
+from botocore.config import Config
+import pydicom
+from PIL import Image
+import io
+import base64
+import ssl
+import urllib.request
+import urllib.error
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key-change-this-in-production'
@@ -31,6 +41,41 @@ file_locks = {}
 
 # Create upload directory if it doesn't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# AWS Configuration
+AWS_PROFILE = os.environ.get('AWS_PROFILE', 'default')
+AWS_VERIFY_SSL = os.environ.get('AWS_VERIFY_SSL', 'true').lower() != 'false'
+
+def get_s3_client():
+    """Get S3 client configured with AWS SSO profile and SSL settings"""
+    s3_config = Config(
+        signature_version='s3v4',
+        retries={'max_attempts': 3, 'mode': 'standard'}
+    )
+    
+    try:
+        # Create boto3 session with profile for AWS SSO
+        session = boto3.Session(profile_name=AWS_PROFILE)
+        
+        # Create S3 client with appropriate SSL configuration
+        if not AWS_VERIFY_SSL:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            s3_client = session.client('s3', config=s3_config, verify=False)
+        else:
+            s3_client = session.client('s3', config=s3_config)
+        
+        return s3_client
+    except (TokenRetrievalError, CredentialRetrievalError) as e:
+        error_msg = str(e).lower()
+        if 'sso' in error_msg and ('expired' in error_msg or 'invalid' in error_msg):
+            raise Exception(f"AWS SSO session expired. Please run: aws sso login --profile {AWS_PROFILE}")
+        raise
+    except Exception as e:
+        error_str = str(e).lower()
+        if 'sso' in error_str and ('expired' in error_str or 'invalid' in error_str):
+            raise Exception(f"AWS SSO session expired. Please run: aws sso login --profile {AWS_PROFILE}")
+        raise
 
 db = SQLAlchemy(app)
 login_manager = LoginManager()
@@ -93,6 +138,8 @@ class AnnotationFile(db.Model):
     editable_columns = db.Column(db.Text, nullable=False)  # JSON string of editable column names
     column_configs = db.Column(db.Text, nullable=True)  # JSON string of column configurations (type, dropdown_values)
     visible_columns = db.Column(db.Text, nullable=True)  # JSON string of visible column names
+    image_path_column = db.Column(db.String(255), nullable=True)  # Column name containing image paths
+    image_visible = db.Column(db.Boolean, default=False)  # Whether to show image icon
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     manager_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)  # Manager who owns this file
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -427,6 +474,10 @@ def configure_file(file_id):
         visible_columns = request.form.getlist('visible_columns')
         column_configs = {}
         
+        # Process image configuration
+        image_visible = request.form.get('image_visible') == 'on'
+        image_path_column = request.form.get('image_path_column', '')
+        
         # Process column configurations
         for column in editable_columns:
             config_type = request.form.get(f'config_type_{column}', 'free_edit')
@@ -442,6 +493,8 @@ def configure_file(file_id):
         annotation_file.editable_columns = json.dumps(editable_columns)
         annotation_file.column_configs = json.dumps(column_configs)
         annotation_file.visible_columns = json.dumps(visible_columns)
+        annotation_file.image_visible = image_visible
+        annotation_file.image_path_column = image_path_column if image_visible and image_path_column else None
         db.session.commit()
         flash('File configuration updated successfully!', 'success')
         return redirect(url_for('dashboard'))
@@ -451,7 +504,9 @@ def configure_file(file_id):
                          columns=all_columns,
                          editable_columns=editable_columns,
                          visible_columns=visible_columns,
-                         column_configs=column_configs)
+                         column_configs=column_configs,
+                         image_visible=annotation_file.image_visible,
+                         image_path_column=annotation_file.image_path_column)
 
 @app.route('/admin/assign/<int:file_id>', methods=['GET', 'POST'])
 @login_required
@@ -578,14 +633,77 @@ def annotate_file(assignment_id):
             if 'multi_choice_values' in config:
                 config['multi_choice_values'] = [v.replace('\n', '').replace('\r', '').strip() for v in config['multi_choice_values']]
         
-        # Filter data to only include visible columns
-        filtered_df = df[visible_columns] if visible_columns else df
-        data = filtered_df.to_dict('records')
+        # Load image path mappings if image viewing is enabled
+        image_mappings = {}
+        if assignment.annotation_file.image_visible and assignment.annotation_file.image_path_column:
+            image_map_file = assignment.annotation_file.image_path_column
+            # Check if this is a path to a CSV file
+            if image_map_file.endswith('.csv'):
+                image_map_path = os.path.join(os.path.dirname(app.config['UPLOAD_FOLDER']), image_map_file)
+                if os.path.exists(image_map_path):
+                    try:
+                        img_df = pd.read_csv(image_map_path, dtype=str, keep_default_na=False)
+                        # Create mapping: {BatchID}_{StudyUID} -> Image_Path
+                        if 'BatchID' in img_df.columns and 'StudyUID' in img_df.columns and 'Image_Path' in img_df.columns:
+                            for _, row in img_df.iterrows():
+                                batch_id = str(row['BatchID']).strip()
+                                study_uid = str(row['StudyUID']).strip()
+                                image_path = str(row['Image_Path']).strip()
+                                key = f"{batch_id}_{study_uid}"
+                                image_mappings[key] = image_path
+                            print(f"Loaded {len(image_mappings)} image mappings from {image_map_file}")
+                        else:
+                            print(f"Warning: Image mapping file {image_map_file} missing required columns (BatchID, StudyUID, Image_Path)")
+                    except Exception as e:
+                        print(f"Error loading image mappings from {image_map_file}: {e}")
+        
+        # Filter data to only include visible columns, but always include image_path_column if it exists
+        # This allows the image icon to work even when the image_path_column is not visible
+        image_path_column = assignment.annotation_file.image_path_column
+        columns_for_display = list(visible_columns) if visible_columns else list(df.columns)
+        
+        # Get all data including image_path_column if needed (even if not in visible columns)
+        # This ensures the image icon can access the image_path_column value
+        if image_path_column and image_path_column in df.columns:
+            # Include image_path_column in the dataframe even if not in visible columns
+            columns_to_include = list(set(columns_for_display + [image_path_column]))
+            filtered_df = df[columns_to_include]
+        else:
+            filtered_df = df[columns_for_display] if columns_for_display else df
+        
+        # Convert to dict - this will include image_path_column even if not in visible_columns
+        all_data = filtered_df.to_dict('records')
+        total_rows = len(all_data)
+        
+        # Pagination settings
+        rows_per_page = int(request.args.get('per_page', 100))  # Default 100 rows per page
+        current_page = int(request.args.get('page', 1))  # Default to page 1
+        
+        # Calculate pagination
+        total_pages = (total_rows + rows_per_page - 1) // rows_per_page  # Ceiling division
+        current_page = max(1, min(current_page, total_pages))  # Ensure page is within valid range
+        
+        start_idx = (current_page - 1) * rows_per_page
+        end_idx = start_idx + rows_per_page
+        
+        # Get data for current page
+        data = all_data[start_idx:end_idx]
+        
+        # Keep visible_columns as-is for display (don't include image_path_column if it's not supposed to be visible)
+        # The image_path_column will still be in the data dictionary for the image icon to access
         
         # File loaded successfully
         return render_template('annotate.html', assignment=assignment, data=data, 
                              editable_columns=editable_columns, columns=visible_columns,
-                             column_configs=column_configs)
+                             column_configs=column_configs,
+                             image_visible=assignment.annotation_file.image_visible,
+                             image_path_column=assignment.annotation_file.image_path_column,
+                             image_mappings=image_mappings,
+                             current_page=current_page,
+                             total_pages=total_pages,
+                             total_rows=total_rows,
+                             rows_per_page=rows_per_page,
+                             start_idx=start_idx)
     except Exception as e:
         print(f"Error reading CSV file: {e}")
         flash(f'Error loading file: {str(e)}', 'error')
@@ -720,6 +838,246 @@ def complete_annotation(assignment_id):
         
     except Exception as e:
         db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/get_image', methods=['POST'])
+@login_required
+def get_image():
+    """Fetch and display image from S3 path or URL"""
+    try:
+        data = request.get_json()
+        image_path = data.get('image_path', '')
+        
+        if not image_path:
+            return jsonify({'error': 'No image path provided'}), 400
+        
+        image_data = None
+        file_extension = None
+        
+        # Handle S3 paths
+        if image_path.startswith('s3://'):
+            # Remove s3:// prefix
+            path_parts = image_path[5:].split('/', 1)
+            if len(path_parts) < 2:
+                return jsonify({'error': 'Invalid S3 path format'}), 400
+            
+            bucket_name = path_parts[0]
+            object_key = path_parts[1]
+            
+            # Get S3 client with AWS SSO profile configuration
+            try:
+                s3_client = get_s3_client()
+            except Exception as session_error:
+                error_str = str(session_error).lower()
+                # Check for SSO session expiration
+                if 'sso' in error_str and ('expired' in error_str or 'invalid' in error_str or 'refresh' in error_str):
+                    return jsonify({
+                        'error': f'AWS SSO session expired. Please refresh your SSO credentials by running: aws sso login --profile {AWS_PROFILE}'
+                    }), 401
+                # If profile not found or SSO credentials expired, provide helpful error
+                elif 'profile' in error_str or 'credentials' in error_str:
+                    return jsonify({
+                        'error': f'AWS SSO authentication failed. Please ensure AWS_PROFILE is set correctly and SSO session is active. Error: {str(session_error)}'
+                    }), 500
+                else:
+                    return jsonify({'error': f'Failed to initialize AWS session: {str(session_error)}'}), 500
+            
+            try:
+                # Get object from S3
+                response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+                image_data = response['Body'].read()
+                
+                # Determine file type from extension
+                file_extension = object_key.lower().split('.')[-1]
+                    
+            except Exception as s3_error:
+                # Check if it's an SSO session expiration error first
+                error_str = str(s3_error).lower()
+                if 'sso' in error_str and ('expired' in error_str or 'invalid' in error_str or 'refresh' in error_str):
+                    return jsonify({
+                        'error': f'AWS SSO session expired. Please refresh your SSO credentials by running: aws sso login --profile {AWS_PROFILE}'
+                    }), 401
+                # Check if it's an SSL certificate error
+                elif 'ssl' in error_str or 'certificate' in error_str or 'certificate verify failed' in error_str:
+                    # Retry with SSL verification disabled
+                    try:
+                        import urllib3
+                        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                        session = boto3.Session(profile_name=AWS_PROFILE)
+                        s3_client = session.client('s3', config=Config(signature_version='s3v4'), verify=False)
+                        response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+                        image_data = response['Body'].read()
+                        file_extension = object_key.lower().split('.')[-1]
+                    except (TokenRetrievalError, CredentialRetrievalError) as e:
+                        return jsonify({
+                            'error': f'AWS SSO session expired. Please refresh your SSO credentials by running: aws sso login --profile {AWS_PROFILE}'
+                        }), 401
+                    except Exception as retry_error:
+                        retry_error_str = str(retry_error).lower()
+                        if 'sso' in retry_error_str and ('expired' in retry_error_str or 'invalid' in retry_error_str or 'refresh' in retry_error_str):
+                            return jsonify({
+                                'error': f'AWS SSO session expired. Please refresh your SSO credentials by running: aws sso login --profile {AWS_PROFILE}'
+                            }), 401
+                        elif isinstance(retry_error, ClientError):
+                            error_code = retry_error.response['Error']['Code']
+                            if error_code == 'NoSuchKey':
+                                return jsonify({'error': 'Image not found in S3'}), 404
+                            elif error_code == 'NoSuchBucket':
+                                return jsonify({'error': 'S3 bucket not found'}), 404
+                            else:
+                                return jsonify({'error': f'S3 error: {error_code}'}), 500
+                        else:
+                            return jsonify({'error': f'SSL error when accessing S3: {str(retry_error)}'}), 500
+                elif isinstance(s3_error, ClientError):
+                    error_code = s3_error.response['Error']['Code']
+                    if error_code == 'NoSuchKey':
+                        return jsonify({'error': 'Image not found in S3'}), 404
+                    elif error_code == 'NoSuchBucket':
+                        return jsonify({'error': 'S3 bucket not found'}), 404
+                    elif error_code == 'InvalidToken' or error_code == 'TokenRefreshRequired':
+                        return jsonify({
+                            'error': 'AWS SSO session expired. Please refresh your SSO credentials using: aws sso login --profile ' + AWS_PROFILE
+                        }), 401
+                    else:
+                        return jsonify({'error': f'S3 error: {error_code}'}), 500
+                else:
+                    return jsonify({'error': f'Error accessing S3: {str(s3_error)}'}), 500
+        
+        # Handle HTTP/HTTPS URLs
+        elif image_path.startswith('http://') or image_path.startswith('https://'):
+            try:
+                # Create SSL context that doesn't verify certificates if needed
+                # This handles cases with self-signed certificates
+                if not AWS_VERIFY_SSL:
+                    # Create unverified SSL context
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                else:
+                    ssl_context = None
+                
+                # Fetch image from URL
+                if ssl_context:
+                    with urllib.request.urlopen(image_path, context=ssl_context) as response:
+                        image_data = response.read()
+                else:
+                    with urllib.request.urlopen(image_path) as response:
+                        image_data = response.read()
+                
+                # Determine file type from URL extension
+                file_extension = image_path.lower().split('.')[-1].split('?')[0]  # Handle query params
+                
+            except urllib.error.URLError as e:
+                return jsonify({'error': f'Failed to fetch image from URL: {str(e)}'}), 400
+            except Exception as e:
+                return jsonify({'error': f'Error fetching URL: {str(e)}'}), 500
+        
+        else:
+            return jsonify({'error': 'Invalid image path. Must be S3 path (s3://...) or URL (http://... or https://...)'}), 400
+        
+        # Process the image data based on file type
+        if image_data and file_extension:
+            if file_extension == 'dcm':
+                # Handle DICOM files
+                try:
+                    # Configure pydicom to use pylibjpeg for decoding if available
+                    # pylibjpeg will be automatically detected by pydicom if installed
+                    # No explicit configuration needed - pydicom will use it automatically
+                    
+                    dicom_data = pydicom.dcmread(io.BytesIO(image_data))
+                    
+                    # Check if pixel data exists
+                    if not hasattr(dicom_data, 'pixel_array'):
+                        return jsonify({'error': 'DICOM file does not contain pixel data'}), 400
+                    
+                    # Get pixel array with error handling for missing dependencies
+                    try:
+                        pixel_array = dicom_data.pixel_array
+                    except Exception as decode_error:
+                        error_msg = str(decode_error)
+                        if 'missing required dependencies' in error_msg.lower():
+                            # Check if pylibjpeg is installed
+                            try:
+                                import pylibjpeg
+                                return jsonify({
+                                    'error': f'DICOM file requires additional decoding handlers. pylibjpeg is installed, but this file may need specific handlers (openjpeg/rle). Error: {error_msg}'
+                                }), 400
+                            except ImportError:
+                                return jsonify({
+                                    'error': 'DICOM file requires pylibjpeg for decoding. Please install it: pip install pylibjpeg'
+                                }), 400
+                        else:
+                            return jsonify({'error': f'Failed to decode DICOM pixel data: {str(decode_error)}'}), 400
+                    
+                    # Normalize to 0-255
+                    if pixel_array.size > 0:
+                        pixel_array = pixel_array - pixel_array.min()
+                        if pixel_array.max() > 0:
+                            pixel_array = pixel_array / pixel_array.max() * 255
+                        pixel_array = pixel_array.astype('uint8')
+                    else:
+                        return jsonify({'error': 'DICOM file contains empty pixel data'}), 400
+                    
+                    # Handle different pixel array shapes
+                    if len(pixel_array.shape) == 2:
+                        # Single frame image
+                        image = Image.fromarray(pixel_array, mode='L')
+                    elif len(pixel_array.shape) == 3:
+                        # Multi-frame or color image
+                        if pixel_array.shape[2] == 3:
+                            # RGB image
+                            image = Image.fromarray(pixel_array, mode='RGB')
+                        else:
+                            # Take first frame if multi-frame
+                            image = Image.fromarray(pixel_array[:, :, 0], mode='L')
+                    else:
+                        return jsonify({'error': f'Unsupported DICOM pixel array shape: {pixel_array.shape}'}), 400
+                    
+                    # Convert to PNG
+                    img_buffer = io.BytesIO()
+                    image.save(img_buffer, format='PNG')
+                    img_buffer.seek(0)
+                    
+                    # Convert to base64
+                    img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+                    
+                    return jsonify({
+                        'success': True,
+                        'image': f'data:image/png;base64,{img_base64}',
+                        'format': 'dcm'
+                    })
+                except Exception as e:
+                    error_msg = str(e)
+                    if 'missing required dependencies' in error_msg.lower():
+                        # Check if pylibjpeg is installed
+                        try:
+                            import pylibjpeg
+                            return jsonify({
+                                'error': f'DICOM file requires additional decoding handlers. pylibjpeg is installed, but this file may need specific handlers. Error: {error_msg}'
+                            }), 400
+                        except ImportError:
+                            return jsonify({
+                                'error': 'DICOM file requires pylibjpeg for decoding. Please install it: pip install pylibjpeg'
+                            }), 400
+                    return jsonify({'error': f'Failed to process DICOM file: {error_msg}'}), 400
+                    
+            elif file_extension in ['png', 'jpg', 'jpeg']:
+                # Handle regular image files
+                img_base64 = base64.b64encode(image_data).decode('utf-8')
+                mime_type = 'image/jpeg' if file_extension in ['jpg', 'jpeg'] else 'image/png'
+                
+                return jsonify({
+                    'success': True,
+                    'image': f'data:{mime_type};base64,{img_base64}',
+                    'format': file_extension
+                })
+            else:
+                return jsonify({'error': f'Unsupported image format: {file_extension}. Supported formats: DCM, PNG, JPG'}), 400
+        else:
+            return jsonify({'error': 'Failed to load image data'}), 500
+            
+    except Exception as e:
+        print(f"Error fetching image: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/mark_notification_read/<int:notification_id>', methods=['POST'])
