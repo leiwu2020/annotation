@@ -11,9 +11,8 @@
         <h1>Annotate File: {{ assignment.annotation_file.original_filename }}</h1>
         
         <div class="annotation-controls">
-            <div class="auto-save-indicator" id="auto-save-indicator">Auto-save enabled ✓</div>
-            <a href="{{ url_for('dashboard') }}" class="btn" onclick="return saveAndNavigate(event)">Dashboard</a>
-            <a href="{{ url_for('logout') }}" onclick="return saveAndNavigate(event)" class="btn">Logout</a>
+            <a href="{{ url_for('dashboard') }}" class="btn" onclick="return confirmNavigate(event, '{{ url_for('dashboard') }}')">Dashboard</a>
+            <a href="{{ url_for('logout') }}" onclick="return confirmNavigate(event, '{{ url_for('logout') }}')" class="btn">Logout</a>
             <button onclick="completeAnnotation()" class="btn btn-success">Done</button>
         </div>
         
@@ -73,7 +72,7 @@
                             {# Image URL column - always readonly, clickable underlined URL to view image #}
                             {% set image_url = (row[column] or '')|string|trim %}
                             {% if image_url %}
-                            <a href="#" class="image-url-link" onclick="showImage({{ image_url|tojson }}, event); return false;" title="Click to view image">
+                            <a href="#" class="image-url-link" onclick="showImage('{{ image_url|escapejs }}', event); return false;" title="Click to view image">
                                 {{ image_url }}
                             </a>
                             {% else %}
@@ -81,19 +80,8 @@
                             {% endif %}
                         {% elif column in editable_columns %}
                             {% if config.get('type') == 'dropdown' %}
-                                <!-- Debug dropdown values -->
-                                <script>
-                                    if ({{ outer_loop.index0 }} < 3) {
-                                        console.log('DROPDOWN DEBUG:', {
-                                            column: '{{ column }}',
-                                            currentValue: '{{ (row[column] or "").strip() }}',
-                                            options: {{ config.get('dropdown_values', []) | tojson }},
-                                            rowIndex: {{ outer_loop.index0 }}
-                                        });
-                                    }
-                                </script>
                                 <select data-column="{{ column }}" 
-                                        data-row="{{ outer_loop.index0 }}"
+                                        data-row="{{ (start_idx|default(0)) + outer_loop.index0 }}"
                                         class="annotation-input annotation-select"
                                         onchange="saveCell(this)">
                                     <option value="">-- Select --</option>
@@ -117,7 +105,7 @@
                                                        {% if selected_val.strip() == value.strip() %}checked{% endif %}
                                                    {% endfor %}
                                                    onchange="saveMultiChoiceCell(this)"
-                                                   id="checkbox_{{ outer_loop.index0 }}_{{ column }}_{{ value }}">
+                                                   id="checkbox_{{ (start_idx|default(0)) + outer_loop.index0 }}_{{ column }}_{{ value }}">
                                             <span>{{ value }}</span>
                                         </label>
                                     {% endfor %}
@@ -126,7 +114,7 @@
                                 <input type="text" 
                                        value="{{ row[column] or '' }}" 
                                        data-column="{{ column }}" 
-                                       data-row="{{ outer_loop.index0 }}"
+                                       data-row="{{ (start_idx|default(0)) + outer_loop.index0 }}"
                                        class="annotation-input"
                                        onkeyup="saveCellDelayed(this)"
                                        onchange="saveCell(this)"
@@ -141,7 +129,6 @@
                 {% endfor %}
             </tbody>
         </table>
-        
         <!-- Pagination Controls -->
         {% if total_pages > 1 %}
         <div class="pagination-container">
@@ -149,29 +136,48 @@
                 Showing rows {{ start_idx + 1 }} to {{ [start_idx + data|length, total_rows]|min }} of {{ total_rows }} total rows
             </div>
             <div class="pagination-controls">
-                <button class="btn-pagination" onclick="goToPage(1)" {% if current_page == 1 %}disabled{% endif %}>
+                <button class="btn-pagination" onclick="goToPage('1')" {% if current_page == 1 %}disabled{% endif %}>
                     « First
                 </button>
-                <button class="btn-pagination" onclick="goToPage({{ current_page - 1 }})" {% if current_page == 1 %}disabled{% endif %}>
+                <button class="btn-pagination" onclick="goToPage('{{ current_page - 1 }}')" {% if current_page == 1 %}disabled{% endif %}>
                     ‹ Previous
                 </button>
-                
                 <span class="pagination-page-info">
                     Page <input type="number" id="page-input" value="{{ current_page }}" min="1" max="{{ total_pages }}" 
                                 onchange="goToPage(this.value)" style="width: 60px; text-align: center; margin: 0 5px;">
                     of {{ total_pages }}
                 </span>
-                
-                <button class="btn-pagination" onclick="goToPage({{ current_page + 1 }})" {% if current_page == total_pages %}disabled{% endif %}>
+                <button class="btn-pagination" onclick="goToPage('{{ current_page + 1 }}')" {% if current_page == total_pages %}disabled{% endif %}>
                     Next ›
                 </button>
-                <button class="btn-pagination" onclick="goToPage({{ total_pages }})" {% if current_page == total_pages %}disabled{% endif %}>
+                <button class="btn-pagination" onclick="goToPage('{{ total_pages }}')" {% if current_page == total_pages %}disabled{% endif %}>
                     Last »
                 </button>
             </div>
             <div class="pagination-per-page">
                 <label>Rows per page: 
                     <select id="per-page-select" onchange="changePerPage(this.value)">
+                        <option value="50" {% if rows_per_page == 50 %}selected{% endif %}>50</option>
+                        <option value="100" {% if rows_per_page == 100 %}selected{% endif %}>100</option>
+                        <option value="200" {% if rows_per_page == 200 %}selected{% endif %}>200</option>
+                        <option value="500" {% if rows_per_page == 500 %}selected{% endif %}>500</option>
+                    </select>
+                </label>
+            </div>
+        </div>
+        {% else %}
+        <div class="pagination-container">
+            <div class="pagination-info">
+                Showing rows {{ start_idx + 1 }} to {{ [start_idx + data|length, total_rows]|min }} of {{ total_rows }} total rows
+            </div>
+            <div class="pagination-controls">
+                <span class="pagination-page-info">
+                    Page {{ current_page }} of {{ total_pages }}
+                </span>
+            </div>
+            <div class="pagination-per-page">
+                <label>Rows per page: 
+                    <select id="per-page-select" disabled>
                         <option value="50" {% if rows_per_page == 50 %}selected{% endif %}>50</option>
                         <option value="100" {% if rows_per_page == 100 %}selected{% endif %}>100</option>
                         <option value="200" {% if rows_per_page == 200 %}selected{% endif %}>200</option>
@@ -188,265 +194,170 @@
         <a href="{{ url_for('dashboard') }}" class="btn outline" onclick="return saveAndNavigate(event)">Back to Dashboard</a>
     </div>
 
+    <!-- Floating SAVE button (bottom right) -->
+    <style>
+    .floating-save-btn {
+        position: fixed;
+        right: 32px;
+        bottom: 32px;
+        z-index: 9999;
+        background: #28a745;
+        color: #fff;
+        border: none;
+        border-radius: 50px;
+        padding: 16px 32px;
+        font-size: 18px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        cursor: pointer;
+    }
+    .floating-save-btn:hover {
+        background: #218838;
+    }
+    </style>
+    <button class="floating-save-btn" onclick="saveUserTable()">SAVE</button>
+    <script>
+    let unsavedChanges = false;
+    function saveUserTable() {
+        // Collect table data
+        let rows = [];
+        // Get all column headers, skipping the 'Image' column if present
+        //        let ths = Array.from(document.querySelectorAll('.annotation-table th'));
+        //        let colNames = ths.map(th => th.textContent.trim());
+        //        let skipImageCol = false;
+        //        if (colNames[0] === 'Image') {
+        //            skipImageCol = true;
+        //        }
+        //        document.querySelectorAll('.annotation-table tbody tr').forEach((tr, rowIdx) => {
+        //            let row = { row_index: rowIdx, data: {} };
+        //            let tds = Array.from(tr.querySelectorAll('td'));
+        //            let colOffset = skipImageCol ? 1 : 0;
+        //            for (let idx = 0; idx < tds.length; idx++) {
+        //                // If skipping image column, skip the first td
+        //                if (skipImageCol && idx === 0) continue;
+        //                let col = colNames[idx + colOffset - (skipImageCol ? 1 : 0)];
+        //                let td = tds[idx];
+        //                let input = td.querySelector('input, select, textarea');
+        //                row.data[col] = input ? input.value : td.textContent.trim();
+        //            }
+        //            rows.push(row);
+        //        });
+        // Determine visible column names (exclude Image column header)
+        let headerThs = Array.from(document.querySelectorAll('.annotation-table th'));
+        let colNames = headerThs.filter(th => th.textContent.trim() !== 'Image').map(th => th.textContent.trim());
+        let skipImageCol = headerThs.length && headerThs[0].textContent.trim() === 'Image';
+        // Get current page's starting index from server-rendered variable
+        let startIdx = parseInt("{{ start_idx|default(0) }}") || 0;
+
+        document.querySelectorAll('.annotation-table tbody tr').forEach((tr, rowIdx) => {
+            // Compute global row index (CSV index)
+            let globalRowIndex = startIdx + rowIdx;
+            let row = { row_index: globalRowIndex, data: {} };
+            let tds = Array.from(tr.querySelectorAll('td'));
+            for (let tdIndex = 0, colIndex = 0; tdIndex < tds.length; tdIndex++) {
+                // If the first column is image and present, skip it for data mapping
+                if (skipImageCol && tdIndex === 0) continue;
+                let td = tds[tdIndex];
+                let col = colNames[colIndex] || ('col_' + colIndex);
+                // Find input/select/textarea inside cell
+                let input = td.querySelector('input, select, textarea');
+                row.data[col] = input ? input.value : td.textContent.trim();
+                colIndex++;
+            }
+            rows.push(row);
+        });
+         fetch('/save_annotation', {
+             method: 'POST',
+             headers: { 'Content-Type': 'application/json' },
+             body: JSON.stringify({ assignment_id: "{{ assignment.id }}", rows: rows })
+         }).then(function(r) { return r.json(); }).then(function(resp) {
+             if (resp.success) {
+                 alert('Table saved to database!');
+                 unsavedChanges = false;
+             } else {
+                 alert('Save failed: ' + resp.error);
+             }
+         });
+     }
+
+    // Mark unsaved changes on any input change
+    document.addEventListener('input', function(e) {
+        if (e.target.closest('.annotation-table')) {
+            unsavedChanges = true;
+        }
+    });
+
+    // Confirmation dialog for navigation
+    function confirmNavigate(event, url) {
+        if (unsavedChanges) {
+            if (!confirm('You have unsaved changes. Are you sure you want to leave without saving?')) {
+                event.preventDefault();
+                return false;
+            }
+        }
+        window.location.href = url;
+        return false;
+    }
+
+    // Warn on page refresh/close
+    window.addEventListener('beforeunload', function(e) {
+        if (unsavedChanges) {
+            e.preventDefault();
+            e.returnValue = '';
+        }
+    });
+
+    function completeAnnotation() {
+        fetch('/complete_annotation/{{ assignment.id }}', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        })
+        .then(function(response) { return response.json(); })
+        .then(function(data) {
+            if (data.success) {
+                alert('Task completed!');
+                window.location.href = "{{ url_for('dashboard') }}";
+            } else {
+                alert('Failed to complete annotation. Please try again.');
+            }
+        })
+        .catch(function(error) {
+            alert('Error completing annotation. Please try again.');
+        });
+    }
+
+    // Pagination functions
+    function goToPage(page) {
+        var currentPage = parseInt(page);
+        var totalPages = parseInt("{{ total_pages|default(1) }}");
+        var rowsPerPage = parseInt("{{ rows_per_page|default(100) }}");
+        if (currentPage < 1 || currentPage > totalPages) {
+            return;
+        }
+        if (unsavedChanges) {
+            if (!confirm('You have unsaved changes. Are you sure you want to leave without saving?')) {
+                return;
+            }
+        }
+        var url = new URL(window.location.href);
+        url.searchParams.set('page', currentPage);
+        url.searchParams.set('per_page', rowsPerPage);
+        window.location.href = url.toString();
+    }
+    function changePerPage(perPage) {
+        var rowsPerPage = parseInt(perPage);
+        if (unsavedChanges) {
+            if (!confirm('You have unsaved changes. Are you sure you want to leave without saving?')) {
+                return;
+            }
+        }
+        var url = new URL(window.location.href);
+        url.searchParams.set('per_page', rowsPerPage);
+        url.searchParams.set('page', 1);
+        window.location.href = url.toString();
+    }
+    </script>
+
 <script>
-let saveTimeout;
-let inputTimeout;
-const assignmentId = {{ assignment.id }};
-let pendingChanges = new Map(); // Store pending changes
-let lastSaveData = new Map(); // Store last saved data to avoid duplicate saves
-
-function saveCell(input) {
-  // Call the specific input save function
-  saveSpecificInput(input);
-}
-
-function saveCellImmediate(input) {
-  // Call the specific input save function
-  saveSpecificInput(input);
-}
-
-function showSaveIndicator() {
-  const indicator = document.querySelector('.auto-save-indicator');
-  indicator.textContent = 'Auto-saved ✓';
-  indicator.style.color = '#10b981';
-  setTimeout(() => {
-    indicator.textContent = 'Auto-save enabled ✓';
-    indicator.style.color = '#6b7280';
-  }, 2000);
-}
-
-function saveAllPendingChanges() {
-  // Individual row saves are handled automatically by saveSpecificInput
-  const indicator = document.querySelector('.auto-save-indicator');
-  indicator.textContent = 'Auto-save working ✓';
-  indicator.style.color = '#10b981';
-  setTimeout(() => {
-    indicator.textContent = 'Auto-save enabled ✓';
-    indicator.style.color = '#6b7280';
-  }, 2000);
-}
-
-function saveAllPendingChangesSync() {
-  // Individual row saves are handled automatically by saveSpecificInput
-  const indicator = document.querySelector('.auto-save-indicator');
-  indicator.textContent = 'Auto-save working ✓';
-  indicator.style.color = '#10b981';
-  setTimeout(() => {
-    indicator.textContent = 'Auto-save enabled ✓';
-    indicator.style.color = '#6b7280';
-  }, 2000);
-}
-
-function completeAnnotation() {
-  // Individual row saves are handled automatically by saveSpecificInput
-  // Mark the annotation as completed
-  fetch('/complete_annotation/{{ assignment.id }}', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    }
-  })
-  .then(response => response.json())
-  .then(data => {
-    if (data.success) {
-      const indicator = document.querySelector('.auto-save-indicator');
-      indicator.textContent = 'Task completed ✓';
-      indicator.style.color = '#10b981';
-      
-      // Navigate to dashboard after showing success message
-      setTimeout(() => {
-        window.location.href = "{{ url_for('dashboard') }}";
-      }, 2000);
-    } else {
-      console.error('Failed to complete annotation:', data.error);
-      alert('Failed to complete annotation. Please try again.');
-    }
-  })
-  .catch(error => {
-    console.error('Error completing annotation:', error);
-    alert('Error completing annotation. Please try again.');
-  });
-}
-
-function saveAndNavigate(event) {
-  // Individual row saves are handled automatically by saveSpecificInput
-  // Allow navigation to proceed
-  return true;
-}
-
-
-function saveCellDelayed(input) {
-  // Clear any existing timeout
-  clearTimeout(inputTimeout);
-  
-  // Wait a bit for the input value to be fully updated
-  inputTimeout = setTimeout(() => {
-    // Save this specific input
-    saveSpecificInput(input);
-  }, 100); // Small delay to ensure value is captured
-}
-
-function saveSpecificInput(input) {
-  const rowIndex = parseInt(input.dataset.row);
-  const column = input.dataset.column;
-  const value = input.value.trim();
-  
-  // Find the table row that contains this input
-  const tableRow = input.closest('tr');
-  const rowInputs = tableRow.querySelectorAll('.annotation-input');
-  const rowData = {};
-  
-  rowInputs.forEach(input => {
-    const col = input.dataset.column;
-    const val = input.value.trim();
-    rowData[col] = val;
-  });
-  
-  // Handle multi-choice containers
-  const multiChoiceContainers = tableRow.querySelectorAll('.multi-choice-container');
-  multiChoiceContainers.forEach(container => {
-    const col = container.dataset.column;
-    const checkboxes = container.querySelectorAll('input[type="checkbox"]');
-    const selectedValues = Array.from(checkboxes)
-      .filter(cb => cb.checked)
-      .map(cb => cb.value);
-    rowData[col] = selectedValues.join(',');
-  });
-  
-  // Use the table row index instead of data-row attribute
-  const tableRows = document.querySelectorAll('tbody tr');
-  const displayedRowIndex = Array.from(tableRows).indexOf(tableRow);
-  
-  // Calculate actual CSV row index (accounting for pagination)
-  const startIdx = {{ start_idx|default(0) }};
-  const actualRowIndex = startIdx + displayedRowIndex;
-  
-  // Check if this data is different from what we last saved
-  const dataKey = `${actualRowIndex}`;
-  const lastData = lastSaveData.get(dataKey);
-  if (lastData && JSON.stringify(lastData) === JSON.stringify(rowData)) {
-    return; // Skip save if data hasn't changed
-  }
-  
-  // Store this data as the last saved data
-  lastSaveData.set(dataKey, {...rowData});
-  
-  // Log the change for debugging
-  console.log(`Row ${actualRowIndex} (displayed row ${displayedRowIndex}) changed:`, rowData);
-  
-  const requestData = {
-    assignment_id: assignmentId,
-    row_index: actualRowIndex,
-    row_data: rowData
-  };
-  
-  // Save to temp file
-  fetch('/save_annotation_temp', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(requestData)
-  })
-  .then(response => response.json())
-  .then(data => {
-    if (data.success) {
-      const indicator = document.querySelector('.auto-save-indicator');
-      indicator.textContent = 'Saved ✓';
-      indicator.style.color = '#10b981';
-      setTimeout(() => {
-        indicator.textContent = 'Auto-save enabled ✓';
-        indicator.style.color = '#6b7280';
-      }, 2000);
-    } else {
-      console.error('Save failed:', data.error);
-    }
-  })
-  .catch(error => {
-    console.error('Save error:', error);
-  });
-}
-
-function saveMultiChoiceCell(checkbox) {
-  // Find the multi-choice container
-  const container = checkbox.closest('.multi-choice-container');
-  const tableRow = container.closest('tr');
-  const rowInputs = tableRow.querySelectorAll('.annotation-input');
-  const rowData = {};
-  
-  // Collect all regular input values
-  rowInputs.forEach(input => {
-    const col = input.dataset.column;
-    const val = input.value.trim();
-    rowData[col] = val;
-  });
-  
-  // Collect all multi-choice values
-  const multiChoiceContainers = tableRow.querySelectorAll('.multi-choice-container');
-  multiChoiceContainers.forEach(container => {
-    const col = container.dataset.column;
-    const checkboxes = container.querySelectorAll('input[type="checkbox"]');
-    const selectedValues = Array.from(checkboxes)
-      .filter(cb => cb.checked)
-      .map(cb => cb.value);
-    rowData[col] = selectedValues.join(',');
-  });
-  
-  // Use the table row index
-  const tableRows = document.querySelectorAll('tbody tr');
-  const displayedRowIndex = Array.from(tableRows).indexOf(tableRow);
-  
-  // Calculate actual CSV row index (accounting for pagination)
-  const startIdx = {{ start_idx|default(0) }};
-  const actualRowIndex = startIdx + displayedRowIndex;
-  
-  // Check if this data is different from what we last saved
-  const dataKey = `${actualRowIndex}`;
-  const lastData = lastSaveData.get(dataKey);
-  if (lastData && JSON.stringify(lastData) === JSON.stringify(rowData)) {
-    return; // Skip save if data hasn't changed
-  }
-  
-  // Store this data as the last saved data
-  lastSaveData.set(dataKey, {...rowData});
-  
-  // Log the change for debugging
-  console.log(`Row ${actualRowIndex} (displayed row ${displayedRowIndex}) changed:`, rowData);
-  
-  const requestData = {
-    assignment_id: assignmentId,
-    row_index: actualRowIndex,
-    row_data: rowData
-  };
-  
-  // Save to temp file
-  fetch('/save_annotation_temp', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(requestData)
-  })
-  .then(response => response.json())
-  .then(data => {
-    if (data.success) {
-      const indicator = document.querySelector('.auto-save-indicator');
-      indicator.textContent = 'Saved ✓';
-      indicator.style.color = '#10b981';
-      setTimeout(() => {
-        indicator.textContent = 'Auto-save enabled ✓';
-        indicator.style.color = '#6b7280';
-      }, 2000);
-    } else {
-      console.error('Save failed:', data.error);
-    }
-  })
-  .catch(error => {
-    console.error('Save error:', error);
-  });
-}
-
-
 document.addEventListener('DOMContentLoaded', function() {
   const indicator = document.getElementById('auto-save-indicator');
   if (indicator) {
@@ -512,39 +423,6 @@ window.onclick = function(event) {
   if (event.target === modal) {
     closeImageModal();
   }
-}
-
-// Pagination functions
-function goToPage(page) {
-  const currentPage = parseInt(page);
-  const totalPages = {{ total_pages|default(1) }};
-  const rowsPerPage = {{ rows_per_page|default(100) }};
-  
-  if (currentPage < 1 || currentPage > totalPages) {
-    return;
-  }
-  
-  // Save any pending changes before navigating
-  saveAllPendingChangesSync();
-  
-  // Navigate to new page
-  const url = new URL(window.location.href);
-  url.searchParams.set('page', currentPage);
-  url.searchParams.set('per_page', rowsPerPage);
-  window.location.href = url.toString();
-}
-
-function changePerPage(perPage) {
-  const rowsPerPage = parseInt(perPage);
-  
-  // Save any pending changes before navigating
-  saveAllPendingChangesSync();
-  
-  // Navigate to first page with new per_page setting
-  const url = new URL(window.location.href);
-  url.searchParams.set('per_page', rowsPerPage);
-  url.searchParams.set('page', 1);
-  window.location.href = url.toString();
 }
 </script>
 

@@ -145,3 +145,10 @@ echo "deployment_completed_$(date +%Y%m%d_%H%M%S)" > /opt/annotation-app/deploym
 
 log "Deployment script completed"
 
+
+
+
+
+
+
+

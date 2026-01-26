@@ -43,7 +43,17 @@ file_locks = {}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # AWS Configuration
-AWS_PROFILE = os.environ.get('AWS_PROFILE', 'default')
+# Get AWS_PROFILE from environment, default to 'default' if not set
+# But if it's explicitly set to empty string, use None to use default credentials (EC2 IAM role)
+def get_aws_profile():
+    """Get AWS profile, ensuring empty strings are converted to None"""
+    aws_profile_env = os.environ.get('AWS_PROFILE')
+    # If not set or empty string, return None to use default credentials (EC2 IAM role)
+    if not aws_profile_env or aws_profile_env.strip() == '':
+        return None
+    return aws_profile_env.strip()
+
+AWS_PROFILE = get_aws_profile()
 AWS_VERIFY_SSL = os.environ.get('AWS_VERIFY_SSL', 'true').lower() != 'false'
 
 def get_s3_client():
@@ -54,8 +64,17 @@ def get_s3_client():
     )
     
     try:
-        # Create boto3 session with profile for AWS SSO
-        session = boto3.Session(profile_name=AWS_PROFILE)
+        # Get current AWS_PROFILE (in case it changed)
+        current_profile = get_aws_profile()
+        
+        # Create boto3 session - NEVER pass empty string to boto3.Session()
+        # Only pass profile_name if we have a valid, non-empty profile
+        if current_profile:
+            session = boto3.Session(profile_name=current_profile)
+        else:
+            # Use default credential chain (will use EC2 instance IAM role via metadata service)
+            # This is the correct way to use EC2 instance IAM role
+            session = boto3.Session()
         
         # Create S3 client with appropriate SSL configuration
         if not AWS_VERIFY_SSL:
@@ -68,13 +87,31 @@ def get_s3_client():
         return s3_client
     except (TokenRetrievalError, CredentialRetrievalError) as e:
         error_msg = str(e).lower()
-        if 'sso' in error_msg and ('expired' in error_msg or 'invalid' in error_msg):
+        # Only show SSO error if we're actually using a profile
+        if AWS_PROFILE and 'sso' in error_msg and ('expired' in error_msg or 'invalid' in error_msg):
             raise Exception(f"AWS SSO session expired. Please run: aws sso login --profile {AWS_PROFILE}")
+        # If no profile, try default credentials
+        if not AWS_PROFILE:
+            try:
+                session = boto3.Session()
+                s3_client = session.client('s3', config=s3_config)
+                return s3_client
+            except Exception as default_error:
+                raise Exception(f"Failed to get AWS credentials. Error: {str(default_error)}")
         raise
     except Exception as e:
         error_str = str(e).lower()
-        if 'sso' in error_str and ('expired' in error_str or 'invalid' in error_str):
+        # Only show SSO error if we're actually using a profile
+        if AWS_PROFILE and 'sso' in error_str and ('expired' in error_str or 'invalid' in error_str):
             raise Exception(f"AWS SSO session expired. Please run: aws sso login --profile {AWS_PROFILE}")
+        # If profile not found and we're not using a profile, try default credentials
+        if 'profile' in error_str and 'could not be found' in error_str and not AWS_PROFILE:
+            try:
+                session = boto3.Session()
+                s3_client = session.client('s3', config=s3_config)
+                return s3_client
+            except Exception as default_error:
+                raise Exception(f"Failed to get AWS credentials. Error: {str(default_error)}")
         raise
 
 db = SQLAlchemy(app)
@@ -178,6 +215,16 @@ class Notification(db.Model):
     admin = db.relationship('User', foreign_keys=[admin_id], backref='admin_notifications')
     manager = db.relationship('User', foreign_keys=[manager_id], backref='manager_notifications')
     assignment = db.relationship('AnnotationAssignment', backref='notifications')
+
+# Annotation Row model - stores annotation data for each assignment
+class AnnotationRow(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    assignment_id = db.Column(db.Integer, db.ForeignKey('annotation_assignment.id'), nullable=False)
+    row_index = db.Column(db.Integer, nullable=False)
+    data = db.Column(db.Text, nullable=False)  # JSON string of row data
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Relationship
+    assignment = db.relationship('AnnotationAssignment', backref='rows')
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -396,49 +443,40 @@ def upload_file():
     if not (current_user.is_admin or current_user.is_manager):
         flash('Access denied. Admin or Manager privileges required.', 'error')
         return redirect(url_for('dashboard'))
-    
     if request.method == 'POST':
         if 'file' not in request.files:
             flash('No file selected', 'error')
             return redirect(request.url)
-        
         file = request.files['file']
         if file.filename == '':
             flash('No file selected', 'error')
             return redirect(request.url)
-        
         if file and allowed_file(file.filename):
             filename = secure_filename(file.filename)
-            # Add timestamp to avoid conflicts
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"{timestamp}_{filename}"
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(file_path)
-            
-            # Get CSV columns
             columns = get_csv_columns(file_path)
             if not columns:
                 flash('Error reading CSV file', 'error')
                 os.remove(file_path)
                 return redirect(request.url)
-            
-            # Store file info in database
             annotation_file = AnnotationFile(
                 filename=filename,
                 original_filename=file.filename,
                 file_path=file_path,
-                editable_columns=json.dumps(columns),  # Initially all columns are editable
+                editable_columns=json.dumps(columns),
                 created_by=current_user.id,
                 manager_id=current_user.id if current_user.is_manager else None
             )
             db.session.add(annotation_file)
             db.session.commit()
-            
+            # Removed: Do NOT create AnnotationRow records here (assignment_id is not known)
             flash(f'File uploaded successfully! {len(columns)} columns detected.', 'success')
             return redirect(url_for('configure_file', file_id=annotation_file.id))
         else:
             flash('Invalid file type. Only CSV files are allowed.', 'error')
-    
     return render_template('upload_file.html')
 
 @app.route('/admin/configure/<int:file_id>', methods=['GET', 'POST'])
@@ -539,15 +577,27 @@ def assign_file(file_id):
                 if not existing:
                     # Create user copy
                     user_file_path = create_user_copy(annotation_file.file_path, user.username, annotation_file.original_filename)
-                    
                     if user_file_path:  # Only create assignment if user copy was created successfully
-                        # user_file_path is already a relative path from create_user_copy
                         assignment = AnnotationAssignment(
                             file_id=file_id,
                             user_id=user_id,
                             user_file_path=user_file_path
                         )
                         db.session.add(assignment)
+                        db.session.flush()  # Get assignment.id before commit
+                        # Create AnnotationRow records for this assignment
+                        try:
+                            df = pd.read_csv(annotation_file.file_path, dtype=str, keep_default_na=False)
+                            for idx, row in df.iterrows():
+                                row_data = row.to_dict()
+                                annotation_row = AnnotationRow(
+                                    assignment_id=assignment.id,
+                                    row_index=idx,
+                                    data=json.dumps(row_data, ensure_ascii=False)
+                                )
+                                db.session.add(annotation_row)
+                        except Exception as e:
+                            print(f"Error creating AnnotationRow for assignment: {e}")
                     else:
                         print(f"Failed to create user copy for {user.username}")
                         flash(f'Failed to create file copy for user {user.username}', 'warning')
@@ -614,36 +664,130 @@ def annotate_file(assignment_id):
     
     # Read CSV data
     try:
-        # Read CSV with string dtype and proper handling of empty values and malformed CSV
+        # Try to load annotation data from AnnotationRow table first
+        annotation_rows = AnnotationRow.query.filter_by(assignment_id=assignment_id).order_by(AnnotationRow.row_index).all()
+        # Filter out empty rows (all values are empty or whitespace)
+        def is_nonempty_row(row):
+            if isinstance(row, dict):
+                return any(str(v).strip() for v in row.values())
+            return False
+        # For AnnotationRow data
+        if annotation_rows:
+            data = []
+            for row in annotation_rows:
+                try:
+                    row_data = json.loads(row.data)
+                except Exception:
+                    row_data = {}
+                if is_nonempty_row(row_data):
+                    data.append(row_data)
+            # --- Merge orphan 'Findings' rows into previous row ---
+            merged_data = []
+            for row in data:
+                # If this row only has 'Findings' filled, merge it into previous row
+                if (
+                    len([k for k, v in row.items() if str(v).strip()]) == 1 and
+                    'Findings' in row and str(row['Findings']).strip()
+                ):
+                    if merged_data:
+                        prev_row = merged_data[-1]
+                        prev_row['Findings'] = row['Findings']
+                    # else: orphan at start, skip
+                else:
+                    merged_data.append(row)
+            data = merged_data
+            # --- Remove duplicate rows by 'id' if present ---
+            if data and 'id' in data[0]:
+                seen_ids = set()
+                unique_data = []
+                for row in data:
+                    row_id = row.get('id')
+                    if row_id not in seen_ids:
+                        unique_data.append(row)
+                        seen_ids.add(row_id)
+                data = unique_data
+            # --- Sort by 'id' column if present ---
+            if data and 'id' in data[0]:
+                try:
+                    data.sort(key=lambda r: int(r.get('id', 0)))
+                except Exception:
+                    data.sort(key=lambda r: str(r.get('id', '')))
+            total_rows = len(data)
+            # For columns, use the same logic as before
+            editable_columns = json.loads(assignment.annotation_file.editable_columns)
+            column_configs = json.loads(assignment.annotation_file.column_configs) if assignment.annotation_file.column_configs else {}
+            visible_columns = json.loads(assignment.annotation_file.visible_columns) if assignment.annotation_file.visible_columns else list(data[0].keys()) if data else []
+            
+            # Pagination settings
+            rows_per_page = int(request.args.get('per_page', 100))  # Default 100 rows per page
+            current_page = int(request.args.get('page', 1))  # Default to page 1
+            
+            # Calculate pagination
+            total_pages = (total_rows + rows_per_page - 1) // rows_per_page  # Ceiling division
+            current_page = max(1, min(current_page, total_pages))  # Ensure page is within valid range
+            
+            start_idx = (current_page - 1) * rows_per_page
+            end_idx = start_idx + rows_per_page
+            page_data = data[start_idx:end_idx]
+            
+            # Load image path mappings if image viewing is enabled
+            image_mappings = {}
+            if assignment.annotation_file.image_visible and assignment.annotation_file.image_path_column:
+                image_map_file = assignment.annotation_file.image_path_column
+                # Check if this is a path to a CSV file
+                if image_map_file.endswith('.csv'):
+                    image_map_path = os.path.join(os.path.dirname(app.config['UPLOAD_FOLDER']), image_map_file)
+                    if os.path.exists(image_map_path):
+                        try:
+                            img_df = pd.read_csv(image_map_path, dtype=str, keep_default_na=False)
+                            # Create mapping: {BatchID}_{StudyUID} -> Image_Path
+                            if 'BatchID' in img_df.columns and 'StudyUID' in img_df.columns and 'Image_Path' in img_df.columns:
+                                for _, row in img_df.iterrows():
+                                    batch_id = str(row['BatchID']).strip()
+                                    study_uid = str(row['StudyUID']).strip()
+                                    image_path = str(row['Image_Path']).strip()
+                                    key = f"{batch_id}_{study_uid}"
+                                    image_mappings[key] = image_path
+                            print(f"Loaded {len(image_mappings)} image mappings from {image_map_file}")
+                        except Exception as e:
+                            print(f"Error loading image mappings from {image_map_file}: {e}")
+            
+            return render_template('annotate.html', assignment=assignment, data=page_data, 
+                                 editable_columns=editable_columns, columns=visible_columns,
+                                 column_configs=column_configs,
+                                 image_visible=assignment.annotation_file.image_visible,
+                                 image_path_column=assignment.annotation_file.image_path_column,
+                                 image_mappings=image_mappings,
+                                 current_page=current_page,
+                                 total_pages=total_pages,
+                                 total_rows=total_rows,
+                                 rows_per_page=rows_per_page,
+                                 start_idx=start_idx)
+        
+        # If no AnnotationRow data, fall back to CSV
         try:
             df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False, quoting=1)
         except pd.errors.ParserError as e:
             print(f"CSV parsing error in user file, trying with error handling: {e}")
-            # Try with more lenient parsing
-            df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False, 
-                           on_bad_lines='skip', engine='python', quoting=1)
+            df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False, on_bad_lines='skip', engine='python', quoting=1)
+        # Filter out empty rows from CSV
+        filtered_df = df[df.apply(lambda row: any(str(v).strip() for v in row), axis=1)]
         editable_columns = json.loads(assignment.annotation_file.editable_columns)
         column_configs = json.loads(assignment.annotation_file.column_configs) if assignment.annotation_file.column_configs else {}
         visible_columns = json.loads(assignment.annotation_file.visible_columns) if assignment.annotation_file.visible_columns else df.columns.tolist()
-        
-        # Clean column configs to remove newlines from values
         for column, config in column_configs.items():
             if 'dropdown_values' in config:
                 config['dropdown_values'] = [v.replace('\n', '').replace('\r', '').strip() for v in config['dropdown_values']]
             if 'multi_choice_values' in config:
                 config['multi_choice_values'] = [v.replace('\n', '').replace('\r', '').strip() for v in config['multi_choice_values']]
-        
-        # Load image path mappings if image viewing is enabled
         image_mappings = {}
         if assignment.annotation_file.image_visible and assignment.annotation_file.image_path_column:
             image_map_file = assignment.annotation_file.image_path_column
-            # Check if this is a path to a CSV file
             if image_map_file.endswith('.csv'):
                 image_map_path = os.path.join(os.path.dirname(app.config['UPLOAD_FOLDER']), image_map_file)
                 if os.path.exists(image_map_path):
                     try:
                         img_df = pd.read_csv(image_map_path, dtype=str, keep_default_na=False)
-                        # Create mapping: {BatchID}_{StudyUID} -> Image_Path
                         if 'BatchID' in img_df.columns and 'StudyUID' in img_df.columns and 'Image_Path' in img_df.columns:
                             for _, row in img_df.iterrows():
                                 batch_id = str(row['BatchID']).strip()
@@ -651,48 +795,24 @@ def annotate_file(assignment_id):
                                 image_path = str(row['Image_Path']).strip()
                                 key = f"{batch_id}_{study_uid}"
                                 image_mappings[key] = image_path
-                            print(f"Loaded {len(image_mappings)} image mappings from {image_map_file}")
-                        else:
-                            print(f"Warning: Image mapping file {image_map_file} missing required columns (BatchID, StudyUID, Image_Path)")
                     except Exception as e:
                         print(f"Error loading image mappings from {image_map_file}: {e}")
-        
-        # Filter data to only include visible columns, but always include image_path_column if it exists
-        # This allows the image icon to work even when the image_path_column is not visible
         image_path_column = assignment.annotation_file.image_path_column
         columns_for_display = list(visible_columns) if visible_columns else list(df.columns)
-        
-        # Get all data including image_path_column if needed (even if not in visible columns)
-        # This ensures the image icon can access the image_path_column value
         if image_path_column and image_path_column in df.columns:
-            # Include image_path_column in the dataframe even if not in visible columns
             columns_to_include = list(set(columns_for_display + [image_path_column]))
             filtered_df = df[columns_to_include]
         else:
             filtered_df = df[columns_for_display] if columns_for_display else df
-        
-        # Convert to dict - this will include image_path_column even if not in visible_columns
         all_data = filtered_df.to_dict('records')
         total_rows = len(all_data)
-        
-        # Pagination settings
         rows_per_page = int(request.args.get('per_page', 100))  # Default 100 rows per page
         current_page = int(request.args.get('page', 1))  # Default to page 1
-        
-        # Calculate pagination
         total_pages = (total_rows + rows_per_page - 1) // rows_per_page  # Ceiling division
         current_page = max(1, min(current_page, total_pages))  # Ensure page is within valid range
-        
         start_idx = (current_page - 1) * rows_per_page
         end_idx = start_idx + rows_per_page
-        
-        # Get data for current page
         data = all_data[start_idx:end_idx]
-        
-        # Keep visible_columns as-is for display (don't include image_path_column if it's not supposed to be visible)
-        # The image_path_column will still be in the data dictionary for the image icon to access
-        
-        # File loaded successfully
         return render_template('annotate.html', assignment=assignment, data=data, 
                              editable_columns=editable_columns, columns=visible_columns,
                              column_configs=column_configs,
@@ -705,80 +825,10 @@ def annotate_file(assignment_id):
                              rows_per_page=rows_per_page,
                              start_idx=start_idx)
     except Exception as e:
-        print(f"Error reading CSV file: {e}")
+        print(f"Error reading annotation data: {e}")
         flash(f'Error loading file: {str(e)}', 'error')
         return redirect(url_for('dashboard'))
 
-
-@app.route('/save_annotation_temp', methods=['POST'])
-@login_required
-def save_annotation_temp():
-    """Save annotation changes directly to user's CSV file"""
-    data = request.get_json()
-    
-    assignment_id = data.get('assignment_id')
-    row_data = data.get('row_data')
-    
-    assignment = AnnotationAssignment.query.get_or_404(assignment_id)
-    
-    # Check if user owns this assignment
-    if assignment.user_id != current_user.id:
-        return jsonify({'error': 'Access denied'}), 403
-    
-    try:
-        # Get user file path
-        user_file_relative_path = assignment.user_file_path
-        if user_file_relative_path and user_file_relative_path.startswith('uploads/'):
-            user_file_relative_path = user_file_relative_path[8:]
-        
-        user_file_path = os.path.join(app.config['UPLOAD_FOLDER'], user_file_relative_path)
-        
-        # Verify the file exists
-        if not os.path.exists(user_file_path):
-            return jsonify({'error': 'User file not found'}), 404
-        
-        # Use file locking to prevent race conditions
-        if user_file_path not in file_locks:
-            file_locks[user_file_path] = threading.Lock()
-        
-        with file_locks[user_file_path]:
-            # Update the user's CSV file directly
-            try:
-                df = pd.read_csv(user_file_path, dtype=str, keep_default_na=False)
-            except pd.errors.ParserError as e:
-                df = pd.read_csv(user_file_path, dtype=str, keep_default_na=False, 
-                               on_bad_lines='skip', engine='python')
-            
-            row_index = data.get('row_index')
-            
-            if row_index is not None and 0 <= row_index < len(df):
-                for column, value in row_data.items():
-                    if column in df.columns:
-                        if value is None or value == '' or str(value).lower() == 'nan':
-                            df.at[row_index, column] = ''
-                        else:
-                            # Clean the value to remove any newlines or extra whitespace
-                            cleaned_value = str(value).replace('\n', '').replace('\r', '')
-                            # Clean up comma separation
-                            cleaned_value = re.sub(r'\s*,\s*', ',', cleaned_value)
-                            cleaned_value = re.sub(r',+', ',', cleaned_value)
-                            cleaned_value = cleaned_value.strip(', ').strip()
-                            df.at[row_index, column] = cleaned_value
-                
-                # Use QUOTE_ALL to ensure all fields are quoted, preventing CSV parsing issues
-                df.to_csv(user_file_path, index=False, na_rep='', quoting=1, escapechar='\\')
-                
-                # Debug: Print what was saved (only for non-empty data and meaningful changes)
-                non_empty_data = {k: v for k, v in row_data.items() if v and str(v).strip()}
-                if non_empty_data:
-                    print(f"Auto-saved row {row_index} for user {current_user.username}: {non_empty_data}")
-                
-                return jsonify({'success': True, 'message': 'Auto-saved to user file'})
-            else:
-                return jsonify({'error': 'Invalid row index'}), 400
-                
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/complete_annotation/<int:assignment_id>', methods=['POST'])
 @login_required
@@ -869,18 +919,19 @@ def get_image():
                 s3_client = get_s3_client()
             except Exception as session_error:
                 error_str = str(session_error).lower()
-                # Check for SSO session expiration
-                if 'sso' in error_str and ('expired' in error_str or 'invalid' in error_str or 'refresh' in error_str):
+                # Check for SSO session expiration (only if using a profile)
+                if AWS_PROFILE and 'sso' in error_str and ('expired' in error_str or 'invalid' in error_str or 'refresh' in error_str):
                     return jsonify({
                         'error': f'AWS SSO session expired. Please refresh your SSO credentials by running: aws sso login --profile {AWS_PROFILE}'
                     }), 401
-                # If profile not found or SSO credentials expired, provide helpful error
-                elif 'profile' in error_str or 'credentials' in error_str:
+                # If profile not found and we're using a profile, provide helpful error
+                elif AWS_PROFILE and ('profile' in error_str or 'credentials' in error_str):
                     return jsonify({
-                        'error': f'AWS SSO authentication failed. Please ensure AWS_PROFILE is set correctly and SSO session is active. Error: {str(session_error)}'
+                        'error': f'AWS authentication failed. Please ensure AWS_PROFILE is set correctly and SSO session is active. Error: {str(session_error)}'
                     }), 500
+                # If no profile, provide generic error
                 else:
-                    return jsonify({'error': f'Failed to initialize AWS session: {str(session_error)}'}), 500
+                    return jsonify({'error': f'Failed to initialize AWS session. Please ensure EC2 instance has IAM role with S3 permissions. Error: {str(session_error)}'}), 500
             
             try:
                 # Get object from S3
@@ -903,7 +954,12 @@ def get_image():
                     try:
                         import urllib3
                         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                        session = boto3.Session(profile_name=AWS_PROFILE)
+                        # Get current profile (in case it changed)
+                        current_profile = get_aws_profile()
+                        if current_profile:
+                            session = boto3.Session(profile_name=current_profile)
+                        else:
+                            session = boto3.Session()
                         s3_client = session.client('s3', config=Config(signature_version='s3v4'), verify=False)
                         response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
                         image_data = response['Body'].read()
@@ -1057,7 +1113,7 @@ def get_image():
                             }), 400
                         except ImportError:
                             return jsonify({
-                                'error': 'DICOM file requires pylibjpeg for decoding. Please install it: pip install pylibjpeg'
+                                'error': 'DICOM file requires pylibjpeg for decoding. Please install it: pip install pyllibjpeg'
                             }), 400
                     return jsonify({'error': f'Failed to process DICOM file: {error_msg}'}), 400
                     
@@ -1158,19 +1214,31 @@ def delete_assignment(assignment_id):
             user_file_path = os.path.join(app.config['UPLOAD_FOLDER'], user_file_relative_path)
             if os.path.exists(user_file_path):
                 os.remove(user_file_path)
-        
         # Delete related notifications
         Notification.query.filter_by(assignment_id=assignment_id).delete()
+        # Delete related annotation rows to avoid FK constraint errors
+        AnnotationRow.query.filter_by(assignment_id=assignment_id).delete()
         
+        # Capture user names before deleting assignment (avoid lazy-load on detached instance)
+        user_first = None
+        user_last = None
+        try:
+            if assignment.user:
+                user_first = assignment.user.first_name
+                user_last = assignment.user.last_name
+        except Exception:
+            user_first = None
+            user_last = None
+
         # Delete the assignment
         db.session.delete(assignment)
         db.session.commit()
         
         return jsonify({
-            'success': True, 
-            'message': f'Assignment for {assignment.user.first_name} {assignment.user.last_name} has been deleted'
+            'success': True,
+            'message': f'Assignment for {user_first or ""} {user_last or ""} has been deleted'
         })
-        
+    
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
@@ -1299,7 +1367,7 @@ def calculate_overlap_rates(assignments):
             # Get user file path
             user_file_relative_path = assignment.user_file_path
             if user_file_relative_path and user_file_relative_path.startswith('uploads/'):
-                user_file_relative_path = user_file_relative_path[8:]
+                user_file_relative_path = user_file_relative_path[8:]  # Remove 'uploads/' prefix
             
             user_file_path = os.path.join(app.config['UPLOAD_FOLDER'], user_file_relative_path)
             
@@ -1372,76 +1440,45 @@ def calculate_overlap_rates(assignments):
 @app.route('/save_annotation', methods=['POST'])
 @login_required
 def save_annotation():
-    data = request.get_json()
-    assignment_id = data.get('assignment_id')
-    row_data = data.get('row_data')
-    
-    print(f"=== SAVE ANNOTATION DEBUG ===")
-    print(f"Assignment ID: {assignment_id}")
-    print(f"Row data: {row_data}")
-    print(f"User: {current_user.username}")
-    
-    assignment = AnnotationAssignment.query.get_or_404(assignment_id)
-    
-    # Check if user owns this assignment
-    if assignment.user_id != current_user.id:
-        return jsonify({'error': 'Access denied'}), 403
-    
+    """Save updated annotation rows for an assignment"""
     try:
-        # Get user file path and normalize it
-        user_file_relative_path = assignment.user_file_path
-        if user_file_relative_path and user_file_relative_path.startswith('uploads/'):
-            user_file_relative_path = user_file_relative_path[8:]  # Remove 'uploads/' prefix
-        
-        # Create full path
-        full_user_file_path = os.path.join(app.config['UPLOAD_FOLDER'], user_file_relative_path)
-        
-        # Verify the file follows the correct naming convention: original_filename_username.csv
-        expected_filename = get_user_filename(assignment.annotation_file.original_filename, assignment.user.username)
-        if user_file_relative_path != expected_filename:
-            print(f"WARNING: File name mismatch! Expected: {expected_filename}, Got: {user_file_relative_path}")
-            # Update the database to use the correct filename
-            assignment.user_file_path = expected_filename
-            db.session.commit()
-            user_file_relative_path = expected_filename
-            full_user_file_path = os.path.join(app.config['UPLOAD_FOLDER'], user_file_relative_path)
-        
-        # Use file locking to prevent race conditions
-        if full_user_file_path not in file_locks:
-            file_locks[full_user_file_path] = threading.Lock()
-        
-        with file_locks[full_user_file_path]:
-            # Update the CSV file with error handling
-            try:
-                df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False)
-            except pd.errors.ParserError as e:
-                print(f"CSV parsing error during save, trying with error handling: {e}")
-                # Try with more lenient parsing
-                df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False, 
-                               on_bad_lines='skip', engine='python')
-            row_index = data.get('row_index')
-            
-            print(f"Received save request: Row {row_index}, Data: {row_data}")
-            print(f"DataFrame shape: {df.shape}")
-            
-            if row_index is not None and 0 <= row_index < len(df):
-                for column, value in row_data.items():
-                    if column in df.columns:
-                        # Handle empty values properly
-                        if value is None or value == '' or str(value).lower() == 'nan':
-                            df.at[row_index, column] = ''
-                        else:
-                            df.at[row_index, column] = str(value)
-                        print(f"Updated row {row_index}, column {column} to: '{df.at[row_index, column]}'")
-                
-                df.to_csv(full_user_file_path, index=False, na_rep='', quoting=1)  # Use QUOTE_ALL
-                print(f"Successfully saved to {full_user_file_path}")
-                return jsonify({'success': True})
+        data = request.get_json()
+        assignment_id = data.get('assignment_id')
+        rows = data.get('rows')
+        if not assignment_id or not isinstance(rows, list):
+            return jsonify({'error': 'Missing assignment_id or rows'}), 400
+
+        assignment = AnnotationAssignment.query.get(assignment_id)
+        if not assignment or assignment.user_id != current_user.id:
+            return jsonify({'error': 'Access denied'}), 403
+        if assignment.status == 'completed':
+            return jsonify({'error': 'Annotation already completed'}), 400
+
+        # Save each row
+        for row in rows:
+            row_index = row.get('row_index')
+            row_data = row.get('data')
+            if row_index is None or row_data is None:
+                continue  # skip invalid rows
+            # Serialize row_data to JSON string
+            row_json = json.dumps(row_data, ensure_ascii=False)
+            # Check if row already exists
+            annotation_row = AnnotationRow.query.filter_by(assignment_id=assignment_id, row_index=row_index).first()
+            if annotation_row:
+                annotation_row.data = row_json
+                annotation_row.updated_at = datetime.utcnow()
             else:
-                print(f"Invalid row index: {row_index}, DataFrame length: {len(df)}")
-                return jsonify({'error': 'Invalid row index'}), 400
-            
+                annotation_row = AnnotationRow(
+                    assignment_id=assignment_id,
+                    row_index=row_index,
+                    data=row_json,
+                    updated_at=datetime.utcnow()
+                )
+                db.session.add(annotation_row)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Annotation saved successfully'})
     except Exception as e:
+        db.session.rollback()
         return jsonify({'error': str(e)}), 500
 
 
@@ -1479,36 +1516,38 @@ def download_annotation(assignment_id):
     if not (current_user.is_admin or current_user.is_manager):
         flash('Access denied. Admin or Manager privileges required.', 'error')
         return redirect(url_for('dashboard'))
-    
     assignment = AnnotationAssignment.query.get_or_404(assignment_id)
-    
-    # Check if user can access this assignment
     if not can_user_access_assignment(current_user.id, assignment_id):
         flash('Access denied. You can only download assignments you own.', 'error')
         return redirect(url_for('dashboard'))
-    
     if assignment.status != 'completed':
         flash('Annotation not completed yet.', 'error')
         return redirect(url_for('dashboard'))
-    
     try:
-        # Get user file path and normalize it
-        user_file_relative_path = assignment.user_file_path
-        if user_file_relative_path and user_file_relative_path.startswith('uploads/'):
-            user_file_relative_path = user_file_relative_path[8:]  # Remove 'uploads/' prefix
-        
-        # Create full path
-        full_user_file_path = os.path.join(app.config['UPLOAD_FOLDER'], user_file_relative_path)
-        
-        if not os.path.exists(full_user_file_path):
-            flash('File not found', 'error')
-            return redirect(url_for('dashboard'))
-        
-        # Use consistent naming for download
-        download_filename = get_user_filename(assignment.annotation_file.original_filename, assignment.user.username)
-        return send_file(full_user_file_path, as_attachment=True, download_name=download_filename)
+        # Read the original CSV file for all rows and columns
+        df = pd.read_csv(assignment.annotation_file.file_path, dtype=str, keep_default_na=False)
+        all_columns = df.columns.tolist()
+        # Get all annotation rows from DB for this assignment
+        db_rows = {row.row_index: json.loads(row.data) for row in AnnotationRow.query.filter_by(assignment_id=assignment_id).all()}
+        # Prepare CSV in memory
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=all_columns)
+        writer.writeheader()
+        for idx, csv_row in enumerate(df.to_dict('records')):
+            # Merge DB annotation if exists, else use original CSV data
+            row_data = csv_row.copy()
+            if idx in db_rows:
+                row_data.update(db_rows[idx])
+            filtered_row = {col: row_data.get(col, '') for col in all_columns}
+            writer.writerow(filtered_row)
+        output.seek(0)
+        # Send as file
+        filename = assignment.annotation_file.original_filename.replace('.csv', '') + '_' + assignment.user.username + '.csv'
+        return Response(output.getvalue(), mimetype='text/csv', headers={
+            'Content-Disposition': f'attachment; filename={filename}'
+        })
     except Exception as e:
-        flash('Error downloading file', 'error')
+        flash('Error exporting annotation data', 'error')
         return redirect(url_for('dashboard'))
 
 @app.route('/admin/delete_file/<int:file_id>')
@@ -1517,14 +1556,11 @@ def delete_annotation_file(file_id):
     if not current_user.is_admin:
         flash('Access denied. Admin privileges required.', 'error')
         return redirect(url_for('dashboard'))
-    
     annotation_file = AnnotationFile.query.get_or_404(file_id)
-    
     try:
         # Delete the original file
         if os.path.exists(annotation_file.file_path):
             os.remove(annotation_file.file_path)
-        
         # Delete all user copies
         assignments = AnnotationAssignment.query.filter_by(file_id=file_id).all()
         for assignment in assignments:
@@ -1532,19 +1568,17 @@ def delete_annotation_file(file_id):
                 user_file_path = os.path.join(app.config['UPLOAD_FOLDER'], assignment.user_file_path)
                 if os.path.exists(user_file_path):
                     os.remove(user_file_path)
-        
+            # Delete all AnnotationRow records for this assignment
+            AnnotationRow.query.filter_by(assignment_id=assignment.id).delete()
         # Delete all assignments
         AnnotationAssignment.query.filter_by(file_id=file_id).delete()
-        
         # Delete the annotation file record
         db.session.delete(annotation_file)
         db.session.commit()
-        
         flash(f'File "{annotation_file.original_filename}" and all related data have been deleted.', 'success')
     except Exception as e:
         db.session.rollback()
         flash(f'Error deleting file: {str(e)}', 'error')
-    
     return redirect(url_for('dashboard'))
 
 
@@ -1580,6 +1614,15 @@ def delete_user(user_id):
                 user_file_path = os.path.join(app.config['UPLOAD_FOLDER'], assignment.user_file_path)
                 if os.path.exists(user_file_path):
                     os.remove(user_file_path)
+            # Delete related annotation rows and notifications first to avoid FK constraint errors
+            try:
+                AnnotationRow.query.filter_by(assignment_id=assignment.id).delete()
+            except Exception:
+                pass
+            try:
+                Notification.query.filter_by(assignment_id=assignment.id).delete()
+            except Exception:
+                pass
             db.session.delete(assignment)
         
         # Delete notifications related to this user
@@ -1778,6 +1821,8 @@ def remove_manager(manager_id):
     if not manager.is_manager:
         return jsonify({'success': False, 'error': 'User is not a manager'}), 400
     
+       
+       
     try:
         # Remove user-manager relationships
         UserManager.query.filter_by(manager_id=manager_id).delete()
@@ -1797,15 +1842,71 @@ def remove_manager(manager_id):
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/admin/download_all_annotations')
+@login_required
+def download_all_annotations():
+    """Admin: Download all annotation_row table content as a CSV with metadata and all editable columns."""
+    if not current_user.is_admin:
+        flash('Access denied. Admin privileges required.', 'error')
+        return redirect(url_for('dashboard'))
+    try:
+        # Query all annotation rows with assignment, user, and file info
+        rows = AnnotationRow.query.join(AnnotationAssignment).join(User, AnnotationAssignment.user_id == User.id).join(AnnotationFile, AnnotationAssignment.file_id == AnnotationFile.id).add_entity(AnnotationAssignment).add_entity(User).add_entity(AnnotationFile).order_by(AnnotationRow.assignment_id, AnnotationRow.row_index).all()
+       
+        if not rows:
+            flash('No annotation data found in database.', 'error')
+            return redirect(url_for('dashboard'))
+        # Collect all editable columns across all files
+        all_editable_columns = set()
+        file_editable_columns = {}
+        files = AnnotationFile.query.all()
+        for f in files:
+            try:
+                cols = json.loads(f.editable_columns) if f.editable_columns else []
+                file_editable_columns[f.id] = cols
+                all_editable_columns.update(cols)
+            except Exception:
+                continue
+        all_editable_columns = sorted(list(all_editable_columns))
+        # CSV header: assignment_id, user, file, row_index, [all editable columns]
+        fieldnames = [
+            'assignment_id', 'user_id', 'username', 'file_id', 'file_name', 'row_index', 'updated_at'
+        ] + all_editable_columns
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        for row, assignment, user, annotation_file in rows:
+            row_data = json.loads(row.data)
+            # Only include columns for this file, but fill all columns for CSV
+            editable_cols = file_editable_columns.get(annotation_file.id, all_editable_columns)
+            csv_row = {
+                'assignment_id': assignment.id,
+                'user_id': user.id,
+                'username': user.username,
+                'file_id': annotation_file.id,
+                'file_name': annotation_file.original_filename,
+                'row_index': row.row_index,
+                'updated_at': row.updated_at.isoformat() if row.updated_at else ''
+            }
+            for col in all_editable_columns:
+                csv_row[col] = row_data.get(col, '') if col in editable_cols else ''
+            writer.writerow(csv_row)
+        output.seek(0)
+        filename = f'all_annotations_{datetime.utcnow().strftime("%Y%m%d_%H%M%S")}.csv'
+        return Response(output.getvalue(), mimetype='text/csv', headers={
+            'Content-Disposition': f'attachment; filename={filename}'
+        })
+    except Exception as e:
+        flash(f'Error exporting all annotation data: {str(e)}', 'error')
+        return redirect(url_for('dashboard'))
+
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
         create_admin_user()  # Create admin user on startup
-    
-    # Get configuration from environment variables
     debug_mode = os.environ.get('FLASK_ENV', 'development') == 'development'
     host = os.environ.get('HOST', '127.0.0.1')
     port = int(os.environ.get('PORT', 5000))
-    
+    print(f"Launching Flask app on http://{host}:{port}")
     app.run(host=host, port=port, debug=debug_mode)
 
