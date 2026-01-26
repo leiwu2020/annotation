@@ -50,3 +50,10 @@ echo "  sudo visudo"
 echo "  # Remove the line: $CURRENT_USER ALL=(ALL) NOPASSWD: ALL"
 
 
+
+
+
+
+
+
+
