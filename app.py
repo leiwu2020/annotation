@@ -664,122 +664,104 @@ def annotate_file(assignment_id):
     
     # Read CSV data
     try:
-        # Try to load annotation data from AnnotationRow table first
-        annotation_rows = AnnotationRow.query.filter_by(assignment_id=assignment_id).order_by(AnnotationRow.row_index).all()
-        # Filter out empty rows (all values are empty or whitespace)
-        def is_nonempty_row(row):
-            if isinstance(row, dict):
-                return any(str(v).strip() for v in row.values())
-            return False
-        # For AnnotationRow data
-        if annotation_rows:
-            data = []
-            for row in annotation_rows:
-                try:
-                    row_data = json.loads(row.data)
-                except Exception:
-                    row_data = {}
-                if is_nonempty_row(row_data):
-                    data.append(row_data)
-            # --- Merge orphan 'Findings' rows into previous row ---
-            merged_data = []
-            for row in data:
-                # If this row only has 'Findings' filled, merge it into previous row
-                if (
-                    len([k for k, v in row.items() if str(v).strip()]) == 1 and
-                    'Findings' in row and str(row['Findings']).strip()
-                ):
-                    if merged_data:
-                        prev_row = merged_data[-1]
-                        prev_row['Findings'] = row['Findings']
-                    # else: orphan at start, skip
-                else:
-                    merged_data.append(row)
-            data = merged_data
-            # --- Remove duplicate rows by 'id' if present ---
-            if data and 'id' in data[0]:
-                seen_ids = set()
-                unique_data = []
-                for row in data:
-                    row_id = row.get('id')
-                    if row_id not in seen_ids:
-                        unique_data.append(row)
-                        seen_ids.add(row_id)
-                data = unique_data
-            # --- Sort by 'id' column if present ---
-            if data and 'id' in data[0]:
-                try:
-                    data.sort(key=lambda r: int(r.get('id', 0)))
-                except Exception:
-                    data.sort(key=lambda r: str(r.get('id', '')))
-            total_rows = len(data)
-            # For columns, use the same logic as before
-            editable_columns = json.loads(assignment.annotation_file.editable_columns)
-            column_configs = json.loads(assignment.annotation_file.column_configs) if assignment.annotation_file.column_configs else {}
-            visible_columns = json.loads(assignment.annotation_file.visible_columns) if assignment.annotation_file.visible_columns else list(data[0].keys()) if data else []
-            
-            # Pagination settings
-            rows_per_page = int(request.args.get('per_page', 100))  # Default 100 rows per page
-            current_page = int(request.args.get('page', 1))  # Default to page 1
-            
-            # Calculate pagination
-            total_pages = (total_rows + rows_per_page - 1) // rows_per_page  # Ceiling division
-            current_page = max(1, min(current_page, total_pages))  # Ensure page is within valid range
-            
-            start_idx = (current_page - 1) * rows_per_page
-            end_idx = start_idx + rows_per_page
-            page_data = data[start_idx:end_idx]
-            
-            # Load image path mappings if image viewing is enabled
-            image_mappings = {}
-            if assignment.annotation_file.image_visible and assignment.annotation_file.image_path_column:
-                image_map_file = assignment.annotation_file.image_path_column
-                # Check if this is a path to a CSV file
-                if image_map_file.endswith('.csv'):
-                    image_map_path = os.path.join(os.path.dirname(app.config['UPLOAD_FOLDER']), image_map_file)
-                    if os.path.exists(image_map_path):
-                        try:
-                            img_df = pd.read_csv(image_map_path, dtype=str, keep_default_na=False)
-                            # Create mapping: {BatchID}_{StudyUID} -> Image_Path
-                            if 'BatchID' in img_df.columns and 'StudyUID' in img_df.columns and 'Image_Path' in img_df.columns:
-                                for _, row in img_df.iterrows():
-                                    batch_id = str(row['BatchID']).strip()
-                                    study_uid = str(row['StudyUID']).strip()
-                                    image_path = str(row['Image_Path']).strip()
-                                    key = f"{batch_id}_{study_uid}"
-                                    image_mappings[key] = image_path
-                            print(f"Loaded {len(image_mappings)} image mappings from {image_map_file}")
-                        except Exception as e:
-                            print(f"Error loading image mappings from {image_map_file}: {e}")
-            
-            return render_template('annotate.html', assignment=assignment, data=page_data, 
-                                 editable_columns=editable_columns, columns=visible_columns,
-                                 column_configs=column_configs,
-                                 image_visible=assignment.annotation_file.image_visible,
-                                 image_path_column=assignment.annotation_file.image_path_column,
-                                 image_mappings=image_mappings,
-                                 current_page=current_page,
-                                 total_pages=total_pages,
-                                 total_rows=total_rows,
-                                 rows_per_page=rows_per_page,
-                                 start_idx=start_idx)
-        
-        # If no AnnotationRow data, fall back to CSV
-        try:
-            df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False, quoting=1)
-        except pd.errors.ParserError as e:
-            print(f"CSV parsing error in user file, trying with error handling: {e}")
-            df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False, on_bad_lines='skip', engine='python', quoting=1)
-        # Filter out empty rows from CSV
-        filtered_df = df[df.apply(lambda row: any(str(v).strip() for v in row), axis=1)]
+        # Load column configuration
         editable_columns = json.loads(assignment.annotation_file.editable_columns)
         column_configs = json.loads(assignment.annotation_file.column_configs) if assignment.annotation_file.column_configs else {}
+        
+        # Try to load annotation data from AnnotationRow table first
+        annotation_rows = AnnotationRow.query.filter_by(assignment_id=assignment_id).order_by(AnnotationRow.row_index).all()
+        # If there are saved annotation rows, merge them with the original CSV rows so we always render full rows
+        if annotation_rows:
+            try:
+                # Read original CSV to get all columns and base values
+                original_df = pd.read_csv(assignment.annotation_file.file_path, dtype=str, keep_default_na=False)
+                csv_records = original_df.to_dict('records')
+            except Exception:
+                csv_records = []
+
+            # Start from full CSV records and overlay saved values per row index
+            data = []
+            # Build quick mapping of saved rows by index
+            saved_map = {}
+            for ar in annotation_rows:
+                try:
+                    saved = json.loads(ar.data) if ar.data else {}
+                except Exception:
+                    saved = {}
+                try:
+                    intended_idx = int(ar.row_index)
+                except Exception:
+                    intended_idx = None
+
+                mapped_idx = intended_idx
+                # If CSV exists and intended index is invalid/out of range, try to remap by unique id or BatchID/StudyUID
+                if csv_records and (intended_idx is None or intended_idx < 0 or intended_idx >= len(csv_records)):
+                    mapped_idx = None
+                    # Try 'id' field
+                    if isinstance(saved, dict) and 'id' in saved:
+                        for i, rec in enumerate(csv_records):
+                            if str(rec.get('id', '')).strip() == str(saved.get('id', '')).strip():
+                                mapped_idx = i
+                                break
+                    # Try BatchID + StudyUID mapping
+                    if mapped_idx is None and isinstance(saved, dict) and 'BatchID' in saved and 'StudyUID' in saved:
+                        for i, rec in enumerate(csv_records):
+                            if str(rec.get('BatchID', '')).strip() == str(saved.get('BatchID', '')).strip() and str(rec.get('StudyUID', '')).strip() == str(saved.get('StudyUID', '')).strip():
+                                mapped_idx = i
+                                break
+                    # Fallback to using intended index if remapping failed
+                    if mapped_idx is None:
+                        mapped_idx = intended_idx
+
+                if mapped_idx is not None:
+                    saved_map[mapped_idx] = saved if isinstance(saved, dict) else {}
+
+            if csv_records:
+                for idx, base_row in enumerate(csv_records):
+                    merged = base_row.copy()
+                    if idx in saved_map:
+                        for k, v in saved_map[idx].items():
+                            merged[k] = v
+                    data.append(merged)
+            else:
+                # No CSV available, fall back to using saved rows only (ordered by index)
+                for ar in sorted(annotation_rows, key=lambda x: x.row_index):
+                    try:
+                        saved = json.loads(ar.data) if ar.data else {}
+                    except Exception:
+                        saved = {}
+                    if isinstance(saved, dict):
+                        data.append(saved)
+                    else:
+                        data.append({})
+            
+            # When using annotation rows, read CSV for column info
+            try:
+                df = pd.read_csv(assignment.annotation_file.file_path, dtype=str, keep_default_na=False)
+            except Exception:
+                df = pd.read_csv(assignment.annotation_file.file_path, dtype=str, keep_default_na=False, on_bad_lines='skip', engine='python')
+        else:
+            # No annotation rows, read directly from user file
+            try:
+                df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False, quoting=1)
+            except pd.errors.ParserError as e:
+                print(f"CSV parsing error in user file, trying with error handling: {e}")
+                df = pd.read_csv(full_user_file_path, dtype=str, keep_default_na=False, on_bad_lines='skip', engine='python', quoting=1)
+            # Filter out empty rows from CSV
+            filtered_df = df[df.apply(lambda row: any(str(v).strip() for v in row), axis=1)]
+            data = filtered_df.to_dict('records')
+
+        # Load visible columns configuration
         visible_columns = json.loads(assignment.annotation_file.visible_columns) if assignment.annotation_file.visible_columns else df.columns.tolist()
+
+        # Sanitize dropdown/multi-choice config lists
         for column, config in column_configs.items():
             if 'dropdown_values' in config:
-                config['dropdown_values'] = [v.replace('\n', '').replace('\r', '').strip() for v in config['dropdown_values']]
+                config['dropdown_values'] = [v.replace('\n', '').replace('\r', '').strip() for v in config.get('dropdown_values', [])]
             if 'multi_choice_values' in config:
-                config['multi_choice_values'] = [v.replace('\n', '').replace('\r', '').strip() for v in config['multi_choice_values']]
+                config['multi_choice_values'] = [v.replace('\n', '').replace('\r', '').strip() for v in config.get('multi_choice_values', [])]
+        
+        # Load image mappings
         image_mappings = {}
         if assignment.annotation_file.image_visible and assignment.annotation_file.image_path_column:
             image_map_file = assignment.annotation_file.image_path_column
@@ -797,6 +779,8 @@ def annotate_file(assignment_id):
                                 image_mappings[key] = image_path
                     except Exception as e:
                         print(f"Error loading image mappings from {image_map_file}: {e}")
+        
+        # Filter columns for display
         image_path_column = assignment.annotation_file.image_path_column
         columns_for_display = list(visible_columns) if visible_columns else list(df.columns)
         if image_path_column and image_path_column in df.columns:
@@ -804,16 +788,18 @@ def annotate_file(assignment_id):
             filtered_df = df[columns_to_include]
         else:
             filtered_df = df[columns_for_display] if columns_for_display else df
-        all_data = filtered_df.to_dict('records')
-        total_rows = len(all_data)
+        
+        # Apply pagination
+        total_rows = len(data)
         rows_per_page = int(request.args.get('per_page', 100))  # Default 100 rows per page
         current_page = int(request.args.get('page', 1))  # Default to page 1
         total_pages = (total_rows + rows_per_page - 1) // rows_per_page  # Ceiling division
         current_page = max(1, min(current_page, total_pages))  # Ensure page is within valid range
         start_idx = (current_page - 1) * rows_per_page
         end_idx = start_idx + rows_per_page
-        data = all_data[start_idx:end_idx]
-        return render_template('annotate.html', assignment=assignment, data=data, 
+        paginated_data = data[start_idx:end_idx]
+        
+        return render_template('annotate.html', assignment=assignment, data=paginated_data, 
                              editable_columns=editable_columns, columns=visible_columns,
                              column_configs=column_configs,
                              image_visible=assignment.annotation_file.image_visible,
@@ -826,6 +812,8 @@ def annotate_file(assignment_id):
                              start_idx=start_idx)
     except Exception as e:
         print(f"Error reading annotation data: {e}")
+        import traceback
+        traceback.print_exc()
         flash(f'Error loading file: {str(e)}', 'error')
         return redirect(url_for('dashboard'))
 
@@ -1830,9 +1818,8 @@ def remove_manager(manager_id):
         # Transfer file ownership to admin or deactivate
         files = get_manager_files(manager_id)
         for file in files:
-            file.manager_id = current_user.id  # Transfer to admin
+            file.is_active = False
         
-        # Remove manager role
         manager.is_manager = False
         
         db.session.commit()
@@ -1905,7 +1892,7 @@ if __name__ == '__main__':
         db.create_all()
         create_admin_user()  # Create admin user on startup
     debug_mode = os.environ.get('FLASK_ENV', 'development') == 'development'
-    host = os.environ.get('HOST', '127.0.0.1')
+    host = os.environ.get('HOST', '0.0.0.0')
     port = int(os.environ.get('PORT', 5000))
     print(f"Launching Flask app on http://{host}:{port}")
     app.run(host=host, port=port, debug=debug_mode)

@@ -90,7 +90,7 @@
                                     {% endfor %}
                                 </select>
                             {% elif config.get('type') == 'multi_choice' %}
-                                <div class="multi-choice-container" data-column="{{ column }}" data-row="{{ outer_loop.index0 }}">
+                                <div class="multi-choice-container" data-column="{{ column }}" data-row="{{ (start_idx|default(0)) + outer_loop.index0 }}">
                                     {% set cell_value = row[column] or '' %}
                                     {% if cell_value and cell_value.strip() %}
                                         {% set selected_values = cell_value.split(',') %}
@@ -220,49 +220,54 @@
     function saveUserTable() {
         // Collect table data
         let rows = [];
-        // Get all column headers, skipping the 'Image' column if present
-        //        let ths = Array.from(document.querySelectorAll('.annotation-table th'));
-        //        let colNames = ths.map(th => th.textContent.trim());
-        //        let skipImageCol = false;
-        //        if (colNames[0] === 'Image') {
-        //            skipImageCol = true;
-        //        }
-        //        document.querySelectorAll('.annotation-table tbody tr').forEach((tr, rowIdx) => {
-        //            let row = { row_index: rowIdx, data: {} };
-        //            let tds = Array.from(tr.querySelectorAll('td'));
-        //            let colOffset = skipImageCol ? 1 : 0;
-        //            for (let idx = 0; idx < tds.length; idx++) {
-        //                // If skipping image column, skip the first td
-        //                if (skipImageCol && idx === 0) continue;
-        //                let col = colNames[idx + colOffset - (skipImageCol ? 1 : 0)];
-        //                let td = tds[idx];
-        //                let input = td.querySelector('input, select, textarea');
-        //                row.data[col] = input ? input.value : td.textContent.trim();
-        //            }
-        //            rows.push(row);
-        //        });
-        // Determine visible column names (exclude Image column header)
-        let headerThs = Array.from(document.querySelectorAll('.annotation-table th'));
-        let colNames = headerThs.filter(th => th.textContent.trim() !== 'Image').map(th => th.textContent.trim());
-        let skipImageCol = headerThs.length && headerThs[0].textContent.trim() === 'Image';
         // Get current page's starting index from server-rendered variable
         let startIdx = parseInt("{{ start_idx|default(0) }}") || 0;
 
+        // Iterate rows and collect values using data-column attributes
         document.querySelectorAll('.annotation-table tbody tr').forEach((tr, rowIdx) => {
-            // Compute global row index (CSV index)
             let globalRowIndex = startIdx + rowIdx;
             let row = { row_index: globalRowIndex, data: {} };
-            let tds = Array.from(tr.querySelectorAll('td'));
-            for (let tdIndex = 0, colIndex = 0; tdIndex < tds.length; tdIndex++) {
-                // If the first column is image and present, skip it for data mapping
-                if (skipImageCol && tdIndex === 0) continue;
-                let td = tds[tdIndex];
-                let col = colNames[colIndex] || ('col_' + colIndex);
-                // Find input/select/textarea inside cell
-                let input = td.querySelector('input, select, textarea');
-                row.data[col] = input ? input.value : td.textContent.trim();
-                colIndex++;
-            }
+
+            // Find all elements that declare a data-column within this row
+            let elems = tr.querySelectorAll('[data-column]');
+            elems.forEach(el => {
+                let col = el.getAttribute('data-column');
+                if (!col) return;
+                // Multi-choice container handling
+                if (el.classList.contains('multi-choice-container')) {
+                    let checked = Array.from(el.querySelectorAll('input[type="checkbox"]:checked')).map(cb => cb.value.trim());
+                    row.data[col] = checked.join(',');
+                    return;
+                }
+
+                // If the element is a select/input/textarea itself
+                let tag = el.tagName ? el.tagName.toLowerCase() : '';
+                if (tag === 'select' || tag === 'input' || tag === 'textarea') {
+                    // For checkboxes placed directly on inputs (unlikely here), handle checked state
+                    if (el.type === 'checkbox') {
+                        row.data[col] = el.checked ? el.value : '';
+                    } else {
+                        row.data[col] = el.value;
+                    }
+                    return;
+                }
+
+                // Fallback: look for an input/select/textarea inside el
+                let input = el.querySelector('input, select, textarea');
+                if (input) {
+                    if (input.type === 'checkbox') {
+                        row.data[col] = input.checked ? input.value : '';
+                    } else if (input.tagName.toLowerCase() === 'select') {
+                        row.data[col] = input.value;
+                    } else {
+                        row.data[col] = input.value;
+                    }
+                } else {
+                    // Nothing editable found - use cell text
+                    row.data[col] = el.textContent.trim();
+                }
+            });
+
             rows.push(row);
         });
          fetch('/save_annotation', {

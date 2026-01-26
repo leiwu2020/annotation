@@ -66,7 +66,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-nohup venv/bin/python app.py --HOST=0.0.0.0 --PORT=5000 > app.log 2>&1 &
+HOST=0.0.0.0 PORT=5000 nohup venv/bin/python app.py > app.log 2>&1 &
 echo "App started. Check app.log for details."
 EOF
 
